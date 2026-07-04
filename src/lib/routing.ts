@@ -118,12 +118,19 @@ function pathLengthWithEndpoints(a: Point, b: Point, points: Point[]): number {
   return routeLength([a, ...points, b]);
 }
 
-function candidateIsSafe(a: Point, b: Point, detours: Point[], nfz: Nfz): boolean {
-  if (detours.some((point) => pointInsideNfz(point, nfz))) return false;
+function candidateIsSafe(
+  a: Point,
+  b: Point,
+  detours: Point[],
+  nfzs: Nfz[],
+): boolean {
+  if (detours.some((point) => nfzs.some((nfz) => pointInsideNfz(point, nfz)))) {
+    return false;
+  }
 
   const points = [a, ...detours, b];
   for (let index = 1; index < points.length; index += 1) {
-    if (segmentIntersectsNfz(points[index - 1], points[index], nfz)) return false;
+    if (firstBlockingNfz(points[index - 1], points[index], nfzs)) return false;
   }
   return true;
 }
@@ -172,6 +179,95 @@ function expandedPolygon(nfz: Nfz, clearanceM: number): Point[] {
   });
 }
 
+function sampledCircleEnvelope(nfz: Nfz, clearanceM: number): Point[] {
+  const radius = Math.max(nfz.radiusM + clearanceM, nfz.radiusM + 25);
+  return Array.from({ length: 16 }, (_, index) =>
+    pointOnCircle(nfz.center, radius, (Math.PI * 2 * index) / 16),
+  );
+}
+
+function nfzEnvelopePoints(nfz: Nfz, clearanceM: number): Point[] {
+  if (nfz.polygon?.length) return expandedPolygon(nfz, clearanceM);
+  return sampledCircleEnvelope(nfz, clearanceM);
+}
+
+function nfzEnvelopesTouch(a: Nfz, b: Nfz, clearanceM: number): boolean {
+  const clusterBufferM = Math.max(180, clearanceM * 2.5);
+  return distance(a.center, b.center) <= a.radiusM + b.radiusM + clusterBufferM;
+}
+
+function nfzCluster(seed: Nfz, nfzs: Nfz[], clearanceM: number): Nfz[] {
+  const cluster: Nfz[] = [];
+  const queue: Nfz[] = [seed];
+  const seen = new Set<string>();
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || seen.has(current.id)) continue;
+    seen.add(current.id);
+    cluster.push(current);
+
+    nfzs.forEach((candidate) => {
+      if (seen.has(candidate.id)) return;
+      const touchesCluster = cluster.some((member) =>
+        nfzEnvelopesTouch(member, candidate, clearanceM),
+      );
+      if (touchesCluster) queue.push(candidate);
+    });
+  }
+
+  return cluster;
+}
+
+function cross(origin: Point, a: Point, b: Point): number {
+  return (a.x - origin.x) * (b.y - origin.y) - (a.y - origin.y) * (b.x - origin.x);
+}
+
+function convexHull(points: Point[]): Point[] {
+  const sorted = [...points]
+    .sort((a, b) => (a.x === b.x ? a.y - b.y : a.x - b.x))
+    .filter(
+      (point, index, all) =>
+        index === 0 || distance(point, all[index - 1]) > 0.5,
+    );
+  if (sorted.length <= 3) return sorted;
+
+  const lower: Point[] = [];
+  sorted.forEach((point) => {
+    while (
+      lower.length >= 2 &&
+      cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0
+    ) {
+      lower.pop();
+    }
+    lower.push(point);
+  });
+
+  const upper: Point[] = [];
+  [...sorted].reverse().forEach((point) => {
+    while (
+      upper.length >= 2 &&
+      cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0
+    ) {
+      upper.pop();
+    }
+    upper.push(point);
+  });
+
+  lower.pop();
+  upper.pop();
+  return [...lower, ...upper];
+}
+
+function pointsCenter(points: Point[]): Point {
+  if (points.length === 0) return { x: 0, y: 0 };
+  const total = points.reduce(
+    (acc, point) => ({ x: acc.x + point.x, y: acc.y + point.y }),
+    { x: 0, y: 0 },
+  );
+  return { x: total.x / points.length, y: total.y / points.length };
+}
+
 function closestVertexIndex(points: Point[], target: Point): number {
   return points.reduce((bestIndex, point, index) => {
     const best = points[bestIndex];
@@ -179,7 +275,12 @@ function closestVertexIndex(points: Point[], target: Point): number {
   }, 0);
 }
 
-function polygonVertexChain(points: Point[], startIndex: number, endIndex: number, step: 1 | -1): Point[] {
+function polygonVertexChain(
+  points: Point[],
+  startIndex: number,
+  endIndex: number,
+  step: 1 | -1,
+): Point[] {
   const chain: Point[] = [];
   let index = startIndex;
   for (let guard = 0; guard <= points.length; guard += 1) {
@@ -188,6 +289,18 @@ function polygonVertexChain(points: Point[], startIndex: number, endIndex: numbe
     index = (index + step + points.length) % points.length;
   }
   return chain;
+}
+
+function polygonPathCandidate(
+  a: Point,
+  b: Point,
+  polygon: Point[],
+  side: number,
+): Point[] {
+  if (polygon.length < 3) return [];
+  const startIndex = closestVertexIndex(polygon, a);
+  const endIndex = closestVertexIndex(polygon, b);
+  return polygonVertexChain(polygon, startIndex, endIndex, side >= 0 ? 1 : -1);
 }
 
 function polygonDetourCandidate(
@@ -200,15 +313,49 @@ function polygonDetourCandidate(
   const expanded = expandedPolygon(nfz, clearanceM);
   if (expanded.length < 3) return circleDetourCandidate(a, b, nfz, side, clearanceM);
 
-  const startIndex = closestVertexIndex(expanded, a);
-  const endIndex = closestVertexIndex(expanded, b);
-  return polygonVertexChain(expanded, startIndex, endIndex, side >= 0 ? 1 : -1);
+  return polygonPathCandidate(a, b, expanded, side);
+}
+
+function clusterFallbackDetourPoints(
+  a: Point,
+  b: Point,
+  seed: Nfz,
+  hull: Point[],
+  side: number,
+  clearanceM: number,
+): Point[] {
+  const center = hull.length > 0 ? pointsCenter(hull) : seed.center;
+  const radiusM = Math.max(seed.radiusM, ...hull.map((point) => distance(center, point)));
+  return fallbackDetourPoints(a, b, { ...seed, center, radiusM }, side, clearanceM);
+}
+
+function clusterDetourCandidate(
+  a: Point,
+  b: Point,
+  seed: Nfz,
+  nfzs: Nfz[],
+  side: number,
+  clearanceM: number,
+): Point[] {
+  const cluster = nfzCluster(seed, nfzs, clearanceM);
+  if (cluster.length === 1) {
+    return seed.polygon?.length
+      ? polygonDetourCandidate(a, b, seed, side, clearanceM)
+      : circleDetourCandidate(a, b, seed, side, clearanceM);
+  }
+
+  const hull = convexHull(cluster.flatMap((nfz) => nfzEnvelopePoints(nfz, clearanceM)));
+  const candidate = polygonPathCandidate(a, b, hull, side);
+  return candidate.length > 0
+    ? candidate
+    : clusterFallbackDetourPoints(a, b, seed, hull, side, clearanceM);
 }
 
 function detourCandidate(
   a: Point,
   b: Point,
   nfz: Nfz,
+  nfzs: Nfz[],
   sideSeed: number,
 ): Point[] {
   const sides = sideSeed >= 0 ? [1, -1] : [-1, 1];
@@ -219,10 +366,8 @@ function detourCandidate(
 
   for (const clearance of clearances) {
     for (const side of sides) {
-      const candidate = nfz.polygon?.length
-        ? polygonDetourCandidate(a, b, nfz, side, clearance)
-        : circleDetourCandidate(a, b, nfz, side, clearance);
-      if (candidateIsSafe(a, b, candidate, nfz)) safeCandidates.push(candidate);
+      const candidate = clusterDetourCandidate(a, b, nfz, nfzs, side, clearance);
+      if (candidateIsSafe(a, b, candidate, nfzs)) safeCandidates.push(candidate);
     }
   }
 
@@ -234,7 +379,14 @@ function detourCandidate(
     );
   }
 
-  return fallbackDetourPoints(a, b, nfz, sides[0], clearances.at(-1) ?? 980);
+  return clusterDetourCandidate(
+    a,
+    b,
+    nfz,
+    nfzs,
+    sides[0],
+    clearances.at(-1) ?? 980,
+  );
 }
 
 function dedupePath(points: Point[]): Point[] {
@@ -279,6 +431,7 @@ export function safePathPoints(
         previous,
         next,
         nfz,
+        nfzs,
         (uavIndex + pass + index) % 2 === 0 ? 1 : -1,
       );
       points.splice(index, 0, ...detours);
