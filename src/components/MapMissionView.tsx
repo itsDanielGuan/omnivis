@@ -6,10 +6,12 @@ import type {
   LngLatBoundsLike,
   Map as MapLibreMap,
   MapMouseEvent,
+  Popup as MapLibrePopup,
   StyleSpecification,
 } from "maplibre-gl";
 import { AlertTriangle, Crosshair, LocateFixed } from "lucide-react";
 import { closeRing, latLonToLocalMeters, pointsToLngLat, toLngLat } from "@/lib/geo";
+import { polygonCentroid } from "@/lib/geometry";
 import { missionToGeoJson } from "@/lib/mapFeatures";
 import { normalizeHomeBase } from "@/lib/routing";
 import type { Feature, FeatureCollection } from "geojson";
@@ -60,6 +62,13 @@ const EDITOR_HIT_LAYERS = [
   "editor-waypoint",
   "editor-base-hit",
   "editor-base",
+  "editor-nfz-fill",
+  "editor-area-fill",
+] as const;
+
+const EDITOR_POPUP_LAYERS = [
+  "editor-base-hit",
+  "editor-waypoint-hit",
   "editor-nfz-fill",
   "editor-area-fill",
 ] as const;
@@ -166,6 +175,57 @@ function editorFeatures({
   selectedNfzId?: string;
 }): Feature[] {
   const features: Feature[] = [];
+  const normalizedHomeBases = homeBases.map((base) => normalizeHomeBase(base));
+
+  areas.forEach((area) => {
+    if (!area.linkedBaseId) return;
+    const linkedBase = normalizedHomeBases.find((base) => base.id === area.linkedBaseId);
+    if (!linkedBase) return;
+    features.push({
+      type: "Feature",
+      geometry: {
+        type: "LineString",
+        coordinates: [
+          toLngLat(mapPreset, linkedBase.point),
+          toLngLat(mapPreset, polygonCentroid(area.polygon)),
+        ],
+      },
+      properties: {
+        kind: "area_base_link",
+        entityKind: "link",
+        id: `${area.id}_${linkedBase.id}`,
+        areaId: area.id,
+        baseId: linkedBase.id,
+        label: `${linkedBase.label} linked to ${area.label}`,
+        selected: area.id === selectedAreaId || linkedBase.id === selectedBaseId,
+      },
+    });
+  });
+
+  areas.forEach((area) => {
+    if (!area.backupBaseId) return;
+    const backupBase = normalizedHomeBases.find((base) => base.id === area.backupBaseId);
+    if (!backupBase) return;
+    features.push({
+      type: "Feature",
+      geometry: {
+        type: "LineString",
+        coordinates: [
+          toLngLat(mapPreset, backupBase.point),
+          toLngLat(mapPreset, polygonCentroid(area.polygon)),
+        ],
+      },
+      properties: {
+        kind: "area_base_backup_link",
+        entityKind: "link",
+        id: `${area.id}_${backupBase.id}_backup`,
+        areaId: area.id,
+        baseId: backupBase.id,
+        label: `${backupBase.label} backup for ${area.label}`,
+        selected: area.id === selectedAreaId || backupBase.id === selectedBaseId,
+      },
+    });
+  });
 
   areas.forEach((area) => {
     features.push({
@@ -181,6 +241,7 @@ function editorFeatures({
         label: area.label,
         groupId: area.groupId,
         linkedBaseId: area.linkedBaseId,
+        backupBaseId: area.backupBaseId,
         selected: area.id === selectedAreaId,
       },
     });
@@ -229,8 +290,7 @@ function editorFeatures({
     });
   });
 
-  homeBases.forEach((base) => {
-    const normalizedBase = normalizeHomeBase(base);
+  normalizedHomeBases.forEach((normalizedBase) => {
     features.push({
       type: "Feature",
       geometry: { type: "Point", coordinates: toLngLat(mapPreset, normalizedBase.point) },
@@ -239,6 +299,7 @@ function editorFeatures({
         entityKind: "base",
         id: normalizedBase.id,
         label: normalizedBase.label,
+        available: normalizedBase.available !== false,
         selected: normalizedBase.id === selectedBaseId,
       },
     });
@@ -308,6 +369,37 @@ function ensureMapImages(map: MapLibreMap) {
   }
 }
 
+function popupContent({
+  kind,
+  label,
+  detail,
+}: {
+  kind: string;
+  label: string;
+  detail?: string;
+}) {
+  const root = document.createElement("div");
+  root.style.cssText =
+    "min-width: 110px; background: rgba(0,0,0,0.82); color: #f5f5f5; padding: 5px 7px; box-shadow: 0 8px 18px rgba(0,0,0,0.28);";
+  const eyebrow = document.createElement("div");
+  eyebrow.style.cssText =
+    "font-size: 8px; letter-spacing: 0.06em; text-transform: uppercase; color: #94a3b8; margin-bottom: 1px;";
+  eyebrow.textContent = kind;
+  const title = document.createElement("div");
+  title.style.cssText =
+    "font-size: 11px; line-height: 1.15; font-weight: 700; color: #f8fafc;";
+  title.textContent = label;
+  root.append(eyebrow, title);
+  if (detail) {
+    const detailNode = document.createElement("div");
+    detailNode.style.cssText =
+      "margin-top: 3px; font-size: 9px; line-height: 1.2; color: #cbd5e1;";
+    detailNode.textContent = detail;
+    root.append(detailNode);
+  }
+  return root;
+}
+
 function addMissionLayers(map: MapLibreMap) {
   ensureMapImages(map);
   if (!map.getSource("editor")) {
@@ -324,6 +416,26 @@ function addMissionLayers(map: MapLibreMap) {
   }
 
   const editorLayers = [
+    {
+      id: "editor-link-line",
+      type: "line",
+      filter: [
+        "in",
+        ["get", "kind"],
+        ["literal", ["area_base_link", "area_base_backup_link"]],
+      ],
+      paint: {
+        "line-color": [
+          "case",
+          ["==", ["get", "kind"], "area_base_backup_link"],
+          "#fbbf24",
+          "#a7f3d0",
+        ],
+        "line-width": ["case", ["==", ["get", "selected"], true], 2.8, 1.8],
+        "line-opacity": ["case", ["==", ["get", "selected"], true], 0.95, 0.62],
+        "line-dasharray": [1, 1.8],
+      },
+    },
     {
       id: "editor-area-fill",
       type: "fill",
@@ -423,7 +535,12 @@ function addMissionLayers(map: MapLibreMap) {
       filter: ["==", ["get", "kind"], "home_base"],
       paint: {
         "circle-radius": ["case", ["==", ["get", "selected"], true], 22, 16],
-        "circle-color": "#38bdf8",
+        "circle-color": [
+          "case",
+          ["==", ["get", "available"], false],
+          "#f59e0b",
+          "#38bdf8",
+        ],
         "circle-opacity": ["case", ["==", ["get", "selected"], true], 0.18, 0.1],
         "circle-stroke-color": "#bae6fd",
         "circle-stroke-width": ["case", ["==", ["get", "selected"], true], 2, 1],
@@ -439,7 +556,12 @@ function addMissionLayers(map: MapLibreMap) {
         "icon-allow-overlap": true,
       },
       paint: {
-        "icon-color": "#e5e7eb",
+        "icon-color": [
+          "case",
+          ["==", ["get", "available"], false],
+          "#fbbf24",
+          "#e5e7eb",
+        ],
         "icon-opacity": 0.98,
       },
     },
@@ -718,6 +840,7 @@ export function MapMissionView({
   const mapRef = useRef<MapLibreMap | null>(null);
   const planIdRef = useRef<string | null>(null);
   const nfzMarkersRef = useRef<Array<{ remove: () => void }>>([]);
+  const popupRef = useRef<MapLibrePopup | null>(null);
   const dragRef = useRef<{
     kind: EditorFeatureKind;
     id: string;
@@ -800,6 +923,12 @@ export function MapMissionView({
         "top-right",
       );
       mapRef.current = map;
+      popupRef.current = new maplibregl.Popup({
+        closeButton: false,
+        closeOnClick: false,
+        offset: 14,
+        className: "omnivis-editor-popup",
+      });
       let overlayReady = false;
       const activateMissionOverlay = () => {
         if (disposed || overlayReady) return;
@@ -823,6 +952,8 @@ export function MapMissionView({
 
     return () => {
       disposed = true;
+      popupRef.current?.remove();
+      popupRef.current = null;
     };
   }, []);
 
@@ -870,6 +1001,96 @@ export function MapMissionView({
         lon: event.lngLat.lng,
       });
 
+    const popupInfoForFeature = (feature: Feature) => {
+      const props = feature.properties ?? {};
+      const id = String(props.id ?? "");
+      const label = String(props.label ?? "");
+      const kind = String(props.kind ?? "");
+      if (kind === "planning_area") {
+        const area = areas.find((candidate) => candidate.id === id);
+        const linkedBase = area?.linkedBaseId
+          ? homeBases.find((base) => base.id === area.linkedBaseId)
+          : undefined;
+        const backupBase = area?.backupBaseId
+          ? homeBases.find((base) => base.id === area.backupBaseId)
+          : undefined;
+        const linkedText = linkedBase
+          ? `Primary ${linkedBase.label}${linkedBase.available === false ? " offline" : ""}`
+          : "No primary base";
+        const backupText = backupBase
+          ? `backup ${backupBase.label}${backupBase.available === false ? " offline" : ""}`
+          : "no backup";
+        return {
+          kind: "Fly area",
+          label: (area?.label ?? label) || "Unnamed area",
+          detail: `${linkedText}; ${backupText}`,
+        };
+      }
+      if (kind === "home_base") {
+        const base = homeBases.find((candidate) => candidate.id === id);
+        const linkedAreas = areas.filter((area) => area.linkedBaseId === id);
+        const backupAreas = areas.filter((area) => area.backupBaseId === id);
+        const roleText = [
+          linkedAreas.length > 0
+            ? `Primary for ${linkedAreas.map((area) => area.label).join(", ")}`
+            : "",
+          backupAreas.length > 0
+            ? `Backup for ${backupAreas.map((area) => area.label).join(", ")}`
+            : "",
+        ].filter(Boolean);
+        return {
+          kind: "Home base",
+          label: `${(base?.label ?? label) || "Unnamed base"}${
+            base?.available === false ? " offline" : ""
+          }`,
+          detail: roleText.length > 0 ? roleText.join("; ") : "No fly area linked",
+        };
+      }
+      if (kind === "planning_nfz") {
+        const nfz = planningNfzs.find((candidate) => candidate.id === id);
+        return {
+          kind: "No-fly zone",
+          label: (nfz?.label ?? label) || "Unnamed NFZ",
+          detail: "Restricted polygon",
+        };
+      }
+      if (kind === "base_waypoint") {
+        return {
+          kind: String(props.direction ?? "") === "outbound" ? "Outbound waypoint" : "Inbound waypoint",
+          label: label || "Base waypoint",
+          detail: "Drag to move",
+        };
+      }
+      return null;
+    };
+
+    const showEditorPopup = (event: MapMouseEvent, feature: Feature) => {
+      const info = popupInfoForFeature(feature);
+      if (!info || !popupRef.current) return;
+      popupRef.current
+        .setLngLat(event.lngLat)
+        .setDOMContent(popupContent(info))
+        .addTo(map);
+    };
+
+    const updateEditorPopup = (event: MapMouseEvent) => {
+      if (!loaded || editorMode !== "select" || dragRef.current) {
+        popupRef.current?.remove();
+        return;
+      }
+      const features = map.queryRenderedFeatures(event.point, {
+        layers: EDITOR_POPUP_LAYERS as unknown as string[],
+      });
+      const feature = features.find(
+        (candidate) => candidate.properties?.kind && candidate.properties?.id,
+      ) as Feature | undefined;
+      if (!feature) {
+        popupRef.current?.remove();
+        return;
+      }
+      showEditorPopup(event, feature);
+    };
+
     function handleClick(event: MapMouseEvent) {
       if (!map) return;
       if (dragRef.current?.moved) {
@@ -895,6 +1116,7 @@ export function MapMissionView({
           (feature) => feature.properties?.entityKind && feature.properties?.id,
         );
         if (editorFeature?.properties?.entityKind && editorFeature.properties.id) {
+          showEditorPopup(event, editorFeature as Feature);
           onSelectEditorFeature(
             editorFeature.properties.entityKind as EditorFeatureKind,
             String(editorFeature.properties.id),
@@ -948,7 +1170,10 @@ export function MapMissionView({
 
     function handleMouseMove(event: MapMouseEvent) {
       const drag = dragRef.current;
-      if (!drag) return;
+      if (!drag) {
+        updateEditorPopup(event);
+        return;
+      }
       const nextPoint = localPoint(event);
       const delta = {
         x: nextPoint.x - drag.lastPoint.x,
@@ -971,6 +1196,7 @@ export function MapMissionView({
     }
 
     function handleMouseLeave() {
+      popupRef.current?.remove();
       if (!dragRef.current) return;
       if (!map) return;
       map.dragPan.enable();
@@ -1039,7 +1265,9 @@ export function MapMissionView({
       }
     };
   }, [
+    areas,
     editorMode,
+    homeBases,
     loaded,
     mapPreset,
     onMapPoint,
@@ -1047,6 +1275,7 @@ export function MapMissionView({
     onSelectEditorFeature,
     onSelectUav,
     plan,
+    planningNfzs,
   ]);
 
   useEffect(() => {
@@ -1126,22 +1355,24 @@ export function MapMissionView({
       <div className="absolute inset-0">
         <div ref={containerRef} className="h-full w-full" />
       </div>
-      <div className="pointer-events-none absolute left-3 top-3 max-w-xs border border-white/10 bg-black/78 p-3 text-xs text-neutral-300 shadow-xl backdrop-blur">
+      <div className="pointer-events-none absolute left-3 top-3 max-w-[15rem] border border-white/10 bg-black/78 p-3 text-xs text-neutral-300 shadow-xl backdrop-blur">
         <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-neutral-100">
           <LocateFixed className="size-4 text-neutral-300" />
-          OpenStreetMap
+          Theater Jump
         </div>
-        <div className="grid grid-cols-2 gap-x-4 gap-y-1">
-          <span className="text-neutral-500">Theater</span>
-          <span>{(plan?.mapPreset ?? mapPreset).shortLabel}</span>
-          <span className="text-neutral-500">Pipeline</span>
-          <span>XY {"->"} WGS84</span>
-          <span className="text-neutral-500">Area</span>
-          <span>
-            {plan
-              ? `${plan.strips.length} strips`
-              : `${areas.length} area${areas.length === 1 ? "" : "s"}`}
+        <div className="grid gap-1.5">
+          <span className="border border-white/10 bg-white/5 px-2 py-1 text-neutral-200">
+            Ukraine-Russia border
           </span>
+          <span className="border border-white/10 bg-white/5 px-2 py-1 text-neutral-200">
+            Iran theater
+          </span>
+          <span className="border border-white/10 bg-white/5 px-2 py-1 text-neutral-200">
+            Palestine-Israel border
+          </span>
+        </div>
+        <div className="mt-2 text-[10px] uppercase tracking-wide text-neutral-500">
+          Preset placeholder
         </div>
       </div>
 

@@ -100,7 +100,8 @@ export const DEFAULT_CONFIG: MissionConfig = {
   turnRadiusM: 90,
   stripAngleDeg: 15,
   rtbSlotSpacingS: 90,
-  commsPolicy: "radio_silent_except_tokens",
+  commsPolicy: "silent_operation",
+  pathPattern: "sector_lanes",
   seed: 7429,
 };
 

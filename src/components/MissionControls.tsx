@@ -29,6 +29,7 @@ import type {
   HomeBase,
   LossResponseMode,
   MissionConfig,
+  PathPattern,
   PlanningArea,
   PlanningNfz,
   PolygonGroup,
@@ -63,6 +64,8 @@ type Props = {
   onCancelDraft: () => void;
   onDeleteSelected: () => void;
   onLinkBaseToArea: () => void;
+  onLinkBackupBaseToArea: () => void;
+  onToggleBaseAvailability: () => void;
   onAddBaseWaypoint: (direction: "outbound" | "inbound") => void;
   onBaseWaypointModeChange: (mode: BaseWaypointMode) => void;
   onSpecificBaseWaypointChange: (
@@ -74,7 +77,6 @@ type Props = {
   onReset: () => void;
   onSimulateLoss: () => void;
   onSetLossResponseMode: (mode: LossResponseMode) => void;
-  onPreviewLossResponseMode: (mode: LossResponseMode) => void;
 };
 
 function updateNumber(
@@ -145,6 +147,8 @@ export function MissionControls({
   onCancelDraft,
   onDeleteSelected,
   onLinkBaseToArea,
+  onLinkBackupBaseToArea,
+  onToggleBaseAvailability,
   onAddBaseWaypoint,
   onBaseWaypointModeChange,
   onSpecificBaseWaypointChange,
@@ -153,20 +157,29 @@ export function MissionControls({
   onReset,
   onSimulateLoss,
   onSetLossResponseMode,
-  onPreviewLossResponseMode,
 }: Props) {
   const selectedArea = areas.find((area) => area.id === selectedAreaId);
   const selectedBase = homeBases.find((base) => base.id === selectedBaseId);
   const linkedBase = selectedArea?.linkedBaseId
     ? homeBases.find((base) => base.id === selectedArea.linkedBaseId)
     : undefined;
-  const displayedBase = selectedBase ?? linkedBase;
+  const backupBase = selectedArea?.backupBaseId
+    ? homeBases.find((base) => base.id === selectedArea.backupBaseId)
+    : undefined;
+  const displayedBase = selectedBase ?? linkedBase ?? backupBase;
+  const linkedBaseOffline = linkedBase?.available === false;
+  const backupBaseOffline = backupBase?.available === false;
   const drawingPolygon = editorMode === "draw_area" || editorMode === "draw_nfz";
   const waypointPlacement =
     editorMode === "place_outbound_waypoint" || editorMode === "place_inbound_waypoint";
+  const operationMode: CommsPolicy =
+    config.commsPolicy === "full_signal" ? "full_signal" : "silent_operation";
+  const spreadAvailable = operationMode === "full_signal";
+  const pathPattern = config.pathPattern ?? "sector_lanes";
 
   return (
-    <aside className="flex min-h-0 flex-col gap-3 overflow-y-auto border-r border-white/10 bg-black p-3">
+    <aside className="flex min-h-0 flex-col border-r border-white/10 bg-black">
+      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
       <div className="border border-white/10 bg-neutral-950 p-3">
         <div className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-neutral-200">
           <ScanLine className="size-4 text-neutral-400" />
@@ -225,21 +238,6 @@ export function MissionControls({
           >
             <Trash2 className="size-4" />
             Delete
-          </button>
-          <button
-            className="inline-flex items-center justify-center gap-2 border border-white/15 bg-neutral-200 px-3 py-2 text-sm font-semibold text-black transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
-            disabled={!canCompile}
-            onClick={onGenerate}
-          >
-            <PlaneTakeoff className="size-4" />
-            Compile
-          </button>
-          <button
-            className="inline-flex items-center justify-center gap-2 border border-white/10 bg-neutral-900 px-3 py-2 text-sm font-semibold text-neutral-100 transition hover:bg-neutral-800"
-            onClick={onReset}
-          >
-            <RotateCcw className="size-4" />
-            Reset Sim
           </button>
           <button
             className="inline-flex items-center justify-center gap-2 border border-white/10 bg-neutral-900 px-3 py-2 text-sm font-semibold text-neutral-100 transition hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-35"
@@ -334,6 +332,9 @@ export function MissionControls({
                       const areaLinkedBase = area.linkedBaseId
                         ? homeBases.find((base) => base.id === area.linkedBaseId)
                         : undefined;
+                      const areaBackupBase = area.backupBaseId
+                        ? homeBases.find((base) => base.id === area.backupBaseId)
+                        : undefined;
                       const selected = selectedAreaId === area.id;
                       return (
                         <button
@@ -350,12 +351,16 @@ export function MissionControls({
                             <span className="truncate">{area.label}</span>
                           </span>
                           <span
-                            className={`inline-flex items-center gap-1 text-[10px] ${
+                            className={`inline-flex min-w-0 items-center gap-1 text-[10px] ${
                               areaLinkedBase ? "text-emerald-300" : "text-neutral-500"
                             }`}
                           >
                             {areaLinkedBase ? <CheckCircle2 className="size-3" /> : null}
-                            {areaLinkedBase?.label ?? "No base"}
+                            <span className="truncate">
+                              {areaLinkedBase?.label ?? "No base"}
+                              {areaLinkedBase?.available === false ? " offline" : ""}
+                              {areaBackupBase ? ` / ${areaBackupBase.label} backup` : ""}
+                            </span>
                           </span>
                         </button>
                       );
@@ -386,11 +391,19 @@ export function MissionControls({
                       onClick={() => onSelectedBaseChange(base.id)}
                     >
                       <span className="flex min-w-0 items-center gap-2">
-                        <Home className="size-3.5 shrink-0 text-emerald-300" />
+                        <Home
+                          className={`size-3.5 shrink-0 ${
+                            base.available === false ? "text-amber-300" : "text-emerald-300"
+                          }`}
+                        />
                         <span className="truncate">{base.label}</span>
                       </span>
-                      <span className="font-mono text-[10px] text-neutral-500">
-                        {base.waypointMode ?? "nearest_safe"}
+                      <span
+                        className={`font-mono text-[10px] ${
+                          base.available === false ? "text-amber-300" : "text-neutral-500"
+                        }`}
+                      >
+                        {base.available === false ? "offline" : (base.waypointMode ?? "nearest_safe")}
                       </span>
                     </button>
                     <div className="ml-3 border-l border-white/10 pl-2">
@@ -532,12 +545,68 @@ export function MissionControls({
           <Link2 className="size-4" />
           Link selected base to selected area
         </button>
+        <div className="mt-2 grid grid-cols-2 gap-2">
+          <button
+            className="inline-flex items-center justify-center gap-2 border border-amber-300/40 bg-amber-400/10 px-2 py-2 text-xs font-semibold text-amber-100 transition hover:bg-amber-400/18 disabled:cursor-not-allowed disabled:opacity-35"
+            disabled={!selectedAreaId || !selectedBaseId || selectedArea?.linkedBaseId === selectedBaseId}
+            onClick={onLinkBackupBaseToArea}
+          >
+            <Link2 className="size-3.5" />
+            Set Backup
+          </button>
+          <button
+            className={`inline-flex items-center justify-center gap-2 border px-2 py-2 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-35 ${
+              selectedBase?.available === false
+                ? "border-emerald-300/40 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/18"
+                : "border-amber-300/40 bg-amber-400/10 text-amber-100 hover:bg-amber-400/18"
+            }`}
+            disabled={!selectedBaseId}
+            onClick={onToggleBaseAvailability}
+          >
+            <AlertTriangle className="size-3.5" />
+            {selectedBase?.available === false ? "Restore Base" : "Mark Offline"}
+          </button>
+        </div>
+        <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
+          <div
+            className={`border p-2 ${
+              linkedBase
+                ? linkedBaseOffline
+                  ? "border-amber-300/35 bg-amber-400/10 text-amber-100"
+                  : "border-emerald-300/30 bg-emerald-400/10 text-emerald-100"
+                : "border-white/10 bg-black text-neutral-500"
+            }`}
+          >
+            <span className="block uppercase tracking-wide text-neutral-500">Primary</span>
+            <span className="mt-1 block truncate font-semibold">
+              {linkedBase?.label ?? "None"}
+              {linkedBaseOffline ? " offline" : ""}
+            </span>
+          </div>
+          <div
+            className={`border p-2 ${
+              backupBase
+                ? backupBaseOffline
+                  ? "border-amber-300/35 bg-amber-400/10 text-amber-100"
+                  : "border-amber-300/30 bg-amber-400/10 text-amber-100"
+                : "border-white/10 bg-black text-neutral-500"
+            }`}
+          >
+            <span className="block uppercase tracking-wide text-neutral-500">Backup</span>
+            <span className="mt-1 block truncate font-semibold">
+              {backupBase?.label ?? "None"}
+              {backupBaseOffline ? " offline" : ""}
+            </span>
+          </div>
+        </div>
         <div className="mt-2 border border-white/10 bg-black p-2 text-xs text-neutral-400">
-          {selectedArea && linkedBase
+          {selectedArea && linkedBaseOffline && backupBase && !backupBaseOffline
+            ? `${linkedBase.label} is offline; compile will route ${selectedArea.label} through backup ${backupBase.label}.`
+            : selectedArea && linkedBase
             ? `${selectedArea.label} is linked to ${linkedBase.label}.`
             : selectedArea && selectedBase
               ? `Ready: ${selectedBase.label} -> ${selectedArea.label}.`
-              : "Pick one blue fly-area file and one green base file, then link them."}
+              : "Pick one blue fly-area file and one green base file, then link them. Select another base to set it as backup."}
         </div>
         {displayedBase ? (
           <div className="mt-3 border border-white/10 bg-black p-2">
@@ -788,16 +857,45 @@ export function MissionControls({
         </div>
         <select
           className="mb-3 w-full border border-white/10 bg-black px-2 py-2 text-sm text-neutral-100 outline-none focus:border-white/30"
-          value={config.commsPolicy}
-          onChange={(event) =>
-            onConfigChange({ ...config, commsPolicy: event.target.value as CommsPolicy })
-          }
+          value={operationMode}
+          onChange={(event) => {
+            const nextPolicy = event.target.value as CommsPolicy;
+            if (nextPolicy === "silent_operation") {
+              onSetLossResponseMode("dispatch_replacement");
+            }
+            onConfigChange({ ...config, commsPolicy: nextPolicy });
+          }}
         >
-          <option value="radio_silent_except_tokens">Radio silent + exception tokens</option>
-          <option value="strict_silent">Strict silent mode</option>
-          <option value="exception_tokens_plus_health">Exception tokens + sparse health</option>
-          <option value="full_signal">Full signal + GPS continuation</option>
+          <option value="silent_operation">Silent operation</option>
+          <option value="full_signal">Full signal + GPS</option>
         </select>
+        <label className="mb-3 block text-xs text-neutral-400">
+          Coverage path
+          <select
+            className="mt-1 w-full border border-white/10 bg-black px-2 py-2 text-sm text-neutral-100 outline-none focus:border-white/30"
+            value={pathPattern}
+            onChange={(event) =>
+              onConfigChange({
+                ...config,
+                pathPattern: event.target.value as PathPattern,
+              })
+            }
+          >
+            <option value="sector_lanes">Sector lanes</option>
+            <option value="alternating_lanes">Alternating lanes</option>
+            <option value="nearest_infill">Nearest infill</option>
+          </select>
+        </label>
+        <div className="mb-3 border border-white/10 bg-black p-2 text-xs text-neutral-400">
+          {operationMode === "full_signal"
+            ? "GPS is available: replacement can continue from the loss point, or active UAVs can spread remaining work."
+            : "Silent operation: only alive/health signals are assumed, so a loss redoes the assigned sector from base."}
+          <span className="mt-1 block text-neutral-500">
+            {pathPattern === "nearest_infill"
+              ? "Spread uses nearest-strip infill from current positions."
+              : "Spread keeps contiguous coverage zones like the default compile."}
+          </span>
+        </div>
         <div className="grid grid-cols-2 gap-2">
           <button
             className={`inline-flex items-center justify-center gap-1.5 border px-2 py-2 text-xs font-semibold transition ${
@@ -806,22 +904,21 @@ export function MissionControls({
                 : "border-white/10 text-neutral-300 hover:bg-neutral-900"
             }`}
             onClick={() => onSetLossResponseMode("dispatch_replacement")}
-            onMouseEnter={() => onPreviewLossResponseMode("dispatch_replacement")}
           >
             <PlaneTakeoff className="size-3.5" />
             Replacement
           </button>
           <button
-            className={`inline-flex items-center justify-center gap-1.5 border px-2 py-2 text-xs font-semibold transition ${
+            className={`inline-flex items-center justify-center gap-1.5 border px-2 py-2 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-35 ${
               lossResponseMode === "spread_remaining_swarm"
                 ? "border-white/30 bg-neutral-200 text-black"
                 : "border-white/10 text-neutral-300 hover:bg-neutral-900"
             }`}
+            disabled={!spreadAvailable}
             onClick={() => onSetLossResponseMode("spread_remaining_swarm")}
-            onMouseEnter={() => onPreviewLossResponseMode("spread_remaining_swarm")}
           >
             <Shuffle className="size-3.5" />
-            Spread
+            {spreadAvailable ? "Spread" : "GPS Spread"}
           </button>
         </div>
         <label className="mt-3 block text-xs text-neutral-400">
@@ -838,6 +935,27 @@ export function MissionControls({
         <div className="mt-3 flex items-start gap-2 border border-white/10 bg-black p-2 text-xs text-neutral-400">
           <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
           Drag polygons or bases on the map. Compile reruns against the selected blue area, linked base, and all red NFZ polygons.
+        </div>
+      </div>
+      </div>
+
+      <div className="shrink-0 border-t border-white/10 bg-black p-3 shadow-[0_-16px_30px_rgba(0,0,0,0.35)]">
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            className="inline-flex items-center justify-center gap-2 border border-white/15 bg-neutral-200 px-3 py-2.5 text-sm font-semibold text-black transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
+            disabled={!canCompile}
+            onClick={onGenerate}
+          >
+            <PlaneTakeoff className="size-4" />
+            Compile
+          </button>
+          <button
+            className="inline-flex items-center justify-center gap-2 border border-white/10 bg-neutral-900 px-3 py-2.5 text-sm font-semibold text-neutral-100 transition hover:bg-neutral-800"
+            onClick={onReset}
+          >
+            <RotateCcw className="size-4" />
+            Reset
+          </button>
         </div>
       </div>
     </aside>

@@ -31,6 +31,7 @@ export function normalizeHomeBase(base: HomeBase): HomeBase {
 
   return {
     ...base,
+    available: base.available !== false,
     outboundWaypoints,
     inboundWaypoints,
     waypointMode,
@@ -52,6 +53,7 @@ export function homeBaseFromPoint(point: Point, label = "Base"): HomeBase {
     id: "base-default",
     label,
     point,
+    available: true,
     outboundWaypoints: [],
     inboundWaypoints: [],
     waypointMode: "nearest_safe",
@@ -83,13 +85,13 @@ function firstBlockingNfz(a: Point, b: Point, nfzs: Nfz[]): Nfz | undefined {
   return nfzs.find((nfz) => segmentIntersectsNfz(a, b, nfz));
 }
 
-function detourPointsAroundNfz(
+function fallbackDetourPoints(
   a: Point,
   b: Point,
   nfz: Nfz,
   side: number,
   clearanceM: number,
-): [Point, Point] {
+): Point[] {
   const dx = b.x - a.x;
   const dy = b.y - a.y;
   const len = Math.hypot(dx, dy) || 1;
@@ -112,6 +114,97 @@ function detourPointsAroundNfz(
   ];
 }
 
+function pathLengthWithEndpoints(a: Point, b: Point, points: Point[]): number {
+  return routeLength([a, ...points, b]);
+}
+
+function candidateIsSafe(a: Point, b: Point, detours: Point[], nfz: Nfz): boolean {
+  if (detours.some((point) => pointInsideNfz(point, nfz))) return false;
+
+  const points = [a, ...detours, b];
+  for (let index = 1; index < points.length; index += 1) {
+    if (segmentIntersectsNfz(points[index - 1], points[index], nfz)) return false;
+  }
+  return true;
+}
+
+function pointOnCircle(center: Point, radius: number, angle: number): Point {
+  return {
+    x: center.x + Math.cos(angle) * radius,
+    y: center.y + Math.sin(angle) * radius,
+  };
+}
+
+function arcSweep(from: number, to: number, side: number): number {
+  const full = Math.PI * 2;
+  const positive = ((to - from) % full + full) % full;
+  return side >= 0 ? positive : positive - full;
+}
+
+function circleDetourCandidate(
+  a: Point,
+  b: Point,
+  nfz: Nfz,
+  side: number,
+  clearanceM: number,
+): Point[] {
+  const radius = Math.max(nfz.radiusM + clearanceM, nfz.radiusM + 25);
+  const startAngle = Math.atan2(a.y - nfz.center.y, a.x - nfz.center.x);
+  const endAngle = Math.atan2(b.y - nfz.center.y, b.x - nfz.center.x);
+  const sweep = arcSweep(startAngle, endAngle, side);
+  const segmentCount = Math.max(2, Math.ceil(Math.abs(sweep) / (Math.PI / 5)));
+
+  return Array.from({ length: segmentCount + 1 }, (_, index) =>
+    pointOnCircle(nfz.center, radius, startAngle + (sweep * index) / segmentCount),
+  );
+}
+
+function expandedPolygon(nfz: Nfz, clearanceM: number): Point[] {
+  const polygon = nfz.polygon ?? [];
+  return polygon.map((point) => {
+    const dx = point.x - nfz.center.x;
+    const dy = point.y - nfz.center.y;
+    const length = Math.hypot(dx, dy) || 1;
+    return {
+      x: point.x + (dx / length) * clearanceM,
+      y: point.y + (dy / length) * clearanceM,
+    };
+  });
+}
+
+function closestVertexIndex(points: Point[], target: Point): number {
+  return points.reduce((bestIndex, point, index) => {
+    const best = points[bestIndex];
+    return distance(point, target) < distance(best, target) ? index : bestIndex;
+  }, 0);
+}
+
+function polygonVertexChain(points: Point[], startIndex: number, endIndex: number, step: 1 | -1): Point[] {
+  const chain: Point[] = [];
+  let index = startIndex;
+  for (let guard = 0; guard <= points.length; guard += 1) {
+    chain.push(points[index]);
+    if (index === endIndex) break;
+    index = (index + step + points.length) % points.length;
+  }
+  return chain;
+}
+
+function polygonDetourCandidate(
+  a: Point,
+  b: Point,
+  nfz: Nfz,
+  side: number,
+  clearanceM: number,
+): Point[] {
+  const expanded = expandedPolygon(nfz, clearanceM);
+  if (expanded.length < 3) return circleDetourCandidate(a, b, nfz, side, clearanceM);
+
+  const startIndex = closestVertexIndex(expanded, a);
+  const endIndex = closestVertexIndex(expanded, b);
+  return polygonVertexChain(expanded, startIndex, endIndex, side >= 0 ? 1 : -1);
+}
+
 function detourCandidate(
   a: Point,
   b: Point,
@@ -119,22 +212,51 @@ function detourCandidate(
   sideSeed: number,
 ): Point[] {
   const sides = sideSeed >= 0 ? [1, -1] : [-1, 1];
-  const clearances = [420, 680, 980, 1320, 1800, 2400];
+  const clearances = nfz.polygon?.length
+    ? [120, 180, 260, 380, 540, 760]
+    : [140, 220, 340, 500, 720, 980];
+  const safeCandidates: Point[][] = [];
 
   for (const clearance of clearances) {
     for (const side of sides) {
-      const [first, second] = detourPointsAroundNfz(a, b, nfz, side, clearance);
-      const safe =
-        !pointInsideNfz(first, nfz) &&
-        !pointInsideNfz(second, nfz) &&
-        !segmentIntersectsNfz(a, first, nfz) &&
-        !segmentIntersectsNfz(first, second, nfz) &&
-        !segmentIntersectsNfz(second, b, nfz);
-      if (safe) return [first, second];
+      const candidate = nfz.polygon?.length
+        ? polygonDetourCandidate(a, b, nfz, side, clearance)
+        : circleDetourCandidate(a, b, nfz, side, clearance);
+      if (candidateIsSafe(a, b, candidate, nfz)) safeCandidates.push(candidate);
     }
   }
 
-  return detourPointsAroundNfz(a, b, nfz, sides[0], clearances.at(-1) ?? 2400);
+  if (safeCandidates.length > 0) {
+    return safeCandidates.reduce((best, candidate) =>
+      pathLengthWithEndpoints(a, b, candidate) < pathLengthWithEndpoints(a, b, best)
+        ? candidate
+        : best,
+    );
+  }
+
+  return fallbackDetourPoints(a, b, nfz, sides[0], clearances.at(-1) ?? 980);
+}
+
+function dedupePath(points: Point[]): Point[] {
+  return points.filter(
+    (point, index) => index === 0 || distance(point, points[index - 1]) > 0.5,
+  );
+}
+
+function compactSafePath(points: Point[], nfzs: Nfz[]): Point[] {
+  const compacted = dedupePath(points);
+  let index = 1;
+  while (index < compacted.length - 1) {
+    const previous = compacted[index - 1];
+    const next = compacted[index + 1];
+    if (!firstBlockingNfz(previous, next, nfzs)) {
+      compacted.splice(index, 1);
+      index = Math.max(1, index - 1);
+    } else {
+      index += 1;
+    }
+  }
+  return compacted;
 }
 
 export function safePathPoints(
@@ -163,10 +285,10 @@ export function safePathPoints(
       changed = true;
       break;
     }
-    if (!changed) return points;
+    if (!changed) return compactSafePath(points, nfzs);
   }
 
-  return points;
+  return compactSafePath(points, nfzs);
 }
 
 export function safePathLength(

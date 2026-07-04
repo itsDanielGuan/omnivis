@@ -14,7 +14,14 @@ import { downloadMissionPackage } from "@/lib/exporters";
 import { getMissionMaxTime, generateMissionPlanFromArea, planningNfzToMissionNfz } from "@/lib/planner";
 import { DEFAULT_CONFIG, getMapPreset } from "@/lib/presets";
 import { normalizeHomeBase } from "@/lib/routing";
-import { applyNfz, applySignalRegain, applyVehicleLoss, armRtbDemo, sendHealthPing } from "@/lib/simulator";
+import {
+  applyBaseOfflineFailover,
+  applyNfz,
+  applySignalRegain,
+  applyVehicleLoss,
+  armRtbDemo,
+  sendHealthPing,
+} from "@/lib/simulator";
 import type {
   BaseWaypointMode,
   DemoMode,
@@ -70,6 +77,58 @@ function shiftPolygon(polygon: Point[], delta: Point, vertexIndex?: number): Poi
   });
 }
 
+function normalizePlanningArea(area: PlanningArea): PlanningArea {
+  return {
+    ...area,
+    backupBaseId: area.backupBaseId === area.linkedBaseId ? undefined : area.backupBaseId,
+  };
+}
+
+function isHomeBaseAvailable(base?: HomeBase): base is HomeBase {
+  return Boolean(base && normalizeHomeBase(base).available !== false);
+}
+
+function resolveAreaHomeBase(
+  area: PlanningArea,
+  homeBases: HomeBase[],
+  selectedBase?: HomeBase,
+): HomeBase | undefined {
+  const primary = area.linkedBaseId
+    ? homeBases.find((base) => base.id === area.linkedBaseId)
+    : undefined;
+  const backup = area.backupBaseId
+    ? homeBases.find((base) => base.id === area.backupBaseId)
+    : undefined;
+
+  if (isHomeBaseAvailable(primary)) return primary;
+  if (isHomeBaseAvailable(backup)) return backup;
+  if (isHomeBaseAvailable(selectedBase)) return selectedBase;
+  return homeBases.find(isHomeBaseAvailable) ?? primary ?? backup ?? selectedBase ?? homeBases[0];
+}
+
+function resolveFailoverBaseForOfflineBase(
+  offlineBaseId: string,
+  areas: PlanningArea[],
+  homeBases: HomeBase[],
+  selectedArea?: PlanningArea,
+): HomeBase | undefined {
+  const orderedAreas = [
+    ...(selectedArea ? [selectedArea] : []),
+    ...areas.filter((area) => area.id !== selectedArea?.id),
+  ].filter((area) => area.linkedBaseId === offlineBaseId);
+
+  for (const area of orderedAreas) {
+    const backup = area.backupBaseId
+      ? homeBases.find((base) => base.id === area.backupBaseId)
+      : undefined;
+    if (backup && backup.id !== offlineBaseId && isHomeBaseAvailable(backup)) return backup;
+  }
+
+  return homeBases.find(
+    (base) => base.id !== offlineBaseId && isHomeBaseAvailable(base),
+  );
+}
+
 function readPersistedState(): PersistedPlanningState | null {
   if (typeof window === "undefined") return null;
   try {
@@ -80,7 +139,7 @@ function readPersistedState(): PersistedPlanningState | null {
     return {
       ...parsed,
       polygonGroups: parsed.polygonGroups?.length ? parsed.polygonGroups : [DEFAULT_GROUP],
-      areas: parsed.areas ?? [],
+      areas: (parsed.areas ?? []).map((area) => normalizePlanningArea(area)),
       homeBases: (parsed.homeBases ?? []).map((base) => normalizeHomeBase(base)),
       planningNfzs: parsed.planningNfzs ?? [],
       activeGroupId: parsed.activeGroupId ?? DEFAULT_GROUP.id,
@@ -156,21 +215,45 @@ export function OmniVisApp() {
   const linkedBase = selectedArea?.linkedBaseId
     ? homeBases.find((base) => base.id === selectedArea.linkedBaseId)
     : undefined;
-  const selectedBase = homeBases.find((base) => base.id === selectedBaseId) ?? linkedBase;
-  const canCompile = Boolean(selectedArea && (selectedBase || homeBases.length > 0));
+  const backupBase = selectedArea?.backupBaseId
+    ? homeBases.find((base) => base.id === selectedArea.backupBaseId)
+    : undefined;
+  const selectedBase = homeBases.find((base) => base.id === selectedBaseId) ?? linkedBase ?? backupBase;
+  const compileBase = selectedArea
+    ? resolveAreaHomeBase(selectedArea, homeBases, selectedBase)
+    : selectedBase;
+  const canCompile = Boolean(selectedArea && compileBase);
 
   const compileMission = useCallback(() => {
     const area = selectedArea ?? areas[0];
     if (!area) return;
-    const base =
-      (area.linkedBaseId && homeBases.find((candidate) => candidate.id === area.linkedBaseId)) ||
-      selectedBase ||
-      homeBases[0];
+    const base = resolveAreaHomeBase(area, homeBases, selectedBase);
+    if (!base) return;
+    const primaryBase = area.linkedBaseId
+      ? homeBases.find((candidate) => candidate.id === area.linkedBaseId)
+      : undefined;
+    const backupBaseForArea = area.backupBaseId
+      ? homeBases.find((candidate) => candidate.id === area.backupBaseId)
+      : undefined;
     const nfzs = planningNfzs.map((nfz, index) =>
       planningNfzToMissionNfz(nfz.label || `NFZ_${index + 1}`, nfz.polygon, simTimeS),
     );
     const nextPlan = generateMissionPlanFromArea(config, area.polygon, base, nfzs);
-    nextPlan.lossResponseMode = lossResponseMode;
+    if (
+      primaryBase &&
+      normalizeHomeBase(primaryBase).available === false &&
+      backupBaseForArea &&
+      base.id === backupBaseForArea.id
+    ) {
+      nextPlan.events.push({
+        id: `EVT_${String(nextPlan.events.length + 1).padStart(3, "0")}_BACKUP_BASE`,
+        timeS: 0,
+        severity: "warning",
+        text: `${primaryBase.label} unavailable; ${backupBaseForArea.label} activated as backup home base`,
+      });
+    }
+    nextPlan.lossResponseMode =
+      config.commsPolicy === "full_signal" ? lossResponseMode : "dispatch_replacement";
     setPlan(nextPlan);
     setSelectedUavId(nextPlan.uavs[0]?.id);
     setSimTimeS(0);
@@ -185,9 +268,25 @@ export function OmniVisApp() {
   }, []);
 
   const handleConfigChange = (next: MissionConfig) => {
-    setConfig(next);
+    const normalizedNext: MissionConfig = {
+      ...next,
+      commsPolicy: next.commsPolicy === "full_signal" ? "full_signal" : "silent_operation",
+      pathPattern: next.pathPattern ?? "sector_lanes",
+    };
+    if (normalizedNext.commsPolicy !== "full_signal") {
+      setLossResponseMode("dispatch_replacement");
+    }
+    setConfig(normalizedNext);
     setPlan(null);
     setSimTimeS(0);
+  };
+
+  const handleLossResponseModeChange = (mode: LossResponseMode) => {
+    if (config.commsPolicy !== "full_signal" && mode === "spread_remaining_swarm") {
+      setLossResponseMode("dispatch_replacement");
+      return;
+    }
+    setLossResponseMode(mode);
   };
 
   const handleEditorModeChange = (mode: EditorMode) => {
@@ -201,6 +300,7 @@ export function OmniVisApp() {
         id: makeId("base"),
         label: `Base ${homeBases.length + 1}`,
         point,
+        available: true,
         outboundWaypoints: [],
         inboundWaypoints: [],
         waypointMode: "nearest_safe",
@@ -257,12 +357,13 @@ export function OmniVisApp() {
 
   const finishPolygon = () => {
     if (draftPolygon.length < 3) return;
+    const polygon = [...draftPolygon];
     if (editorMode === "draw_area") {
       const area: PlanningArea = {
         id: makeId("area"),
         label: `Area ${areas.length + 1}`,
         groupId: activeGroupId,
-        polygon: draftPolygon,
+        polygon,
         linkedBaseId: selectedBaseId,
       };
       setAreas((current) => [...current, area]);
@@ -273,9 +374,12 @@ export function OmniVisApp() {
       const nfz: PlanningNfz = {
         id: makeId("nfz"),
         label: `NFZ ${planningNfzs.length + 1}`,
-        polygon: draftPolygon,
+        polygon,
       };
       setPlanningNfzs((current) => [...current, nfz]);
+      setPlan((current) =>
+        current ? applyNfz(current, polygon, simTimeS, selectedUavId) : current,
+      );
       setSelectedNfzId(nfz.id);
       setSelectedAreaId(undefined);
       setSelectedBaseId(undefined);
@@ -301,7 +405,15 @@ export function OmniVisApp() {
       setHomeBases((current) => current.filter((base) => base.id !== selectedBaseId));
       setAreas((current) =>
         current.map((area) =>
-          area.linkedBaseId === selectedBaseId ? { ...area, linkedBaseId: undefined } : area,
+          area.linkedBaseId === selectedBaseId || area.backupBaseId === selectedBaseId
+            ? {
+                ...area,
+                linkedBaseId:
+                  area.linkedBaseId === selectedBaseId ? undefined : area.linkedBaseId,
+                backupBaseId:
+                  area.backupBaseId === selectedBaseId ? undefined : area.backupBaseId,
+              }
+            : area,
         ),
       );
       setSelectedBaseId(undefined);
@@ -316,9 +428,53 @@ export function OmniVisApp() {
     if (!selectedAreaId || !selectedBaseId) return;
     setAreas((current) =>
       current.map((area) =>
-        area.id === selectedAreaId ? { ...area, linkedBaseId: selectedBaseId } : area,
+        area.id === selectedAreaId
+          ? {
+              ...area,
+              linkedBaseId: selectedBaseId,
+              backupBaseId:
+                area.backupBaseId === selectedBaseId ? undefined : area.backupBaseId,
+            }
+          : area,
       ),
     );
+    setPlan(null);
+  };
+
+  const linkBackupBaseToArea = () => {
+    if (!selectedAreaId || !selectedBaseId) return;
+    setAreas((current) =>
+      current.map((area) => {
+        if (area.id !== selectedAreaId || area.linkedBaseId === selectedBaseId) return area;
+        return { ...area, backupBaseId: selectedBaseId };
+      }),
+    );
+    setPlan(null);
+  };
+
+  const toggleSelectedBaseAvailability = () => {
+    if (!selectedBaseId) return;
+    const currentBase = homeBases.find((base) => base.id === selectedBaseId);
+    if (!currentBase) return;
+    const normalizedBase = normalizeHomeBase(currentBase);
+    const markingOffline = normalizedBase.available !== false;
+    const failoverBase = markingOffline
+      ? resolveFailoverBaseForOfflineBase(selectedBaseId, areas, homeBases, selectedArea)
+      : undefined;
+
+    setHomeBases((current) =>
+      current.map((base) => {
+        if (base.id !== selectedBaseId) return base;
+        const normalized = normalizeHomeBase(base);
+        return { ...normalized, available: normalized.available === false };
+      }),
+    );
+
+    if (markingOffline && plan?.homeBase.id === selectedBaseId && failoverBase) {
+      setPlan(applyBaseOfflineFailover(plan, selectedBaseId, failoverBase, simTimeS));
+    } else if (!plan) {
+      setPlan(null);
+    }
   };
 
   const updateSelectedBaseRoutingMode = (mode: BaseWaypointMode) => {
@@ -476,8 +632,10 @@ export function OmniVisApp() {
       setLossResponseMode("dispatch_replacement");
       setPlan(applyVehicleLoss(plan, selectedUavId ?? "UAV_3", "dispatch_replacement", simTimeS || 180));
     } else if (mode === "loss_spread") {
-      setLossResponseMode("spread_remaining_swarm");
-      setPlan(applyVehicleLoss(plan, selectedUavId ?? "UAV_3", "spread_remaining_swarm", simTimeS || 180));
+      const spreadMode =
+        config.commsPolicy === "full_signal" ? "spread_remaining_swarm" : "dispatch_replacement";
+      setLossResponseMode(spreadMode);
+      setPlan(applyVehicleLoss(plan, selectedUavId ?? "UAV_3", spreadMode, simTimeS || 180));
     } else if (mode === "nfz") {
       triggerNfzDemo();
     } else if (mode === "rtb") {
@@ -536,6 +694,8 @@ export function OmniVisApp() {
           }}
           onDeleteSelected={deleteSelected}
           onLinkBaseToArea={linkBaseToArea}
+          onLinkBackupBaseToArea={linkBackupBaseToArea}
+          onToggleBaseAvailability={toggleSelectedBaseAvailability}
           onAddBaseWaypoint={(direction) =>
             setEditorMode(direction === "outbound" ? "place_outbound_waypoint" : "place_inbound_waypoint")
           }
@@ -545,8 +705,7 @@ export function OmniVisApp() {
           onGenerate={compileMission}
           onReset={resetSimulation}
           onSimulateLoss={triggerLoss}
-          onSetLossResponseMode={setLossResponseMode}
-          onPreviewLossResponseMode={setLossResponseMode}
+          onSetLossResponseMode={handleLossResponseModeChange}
         />
         <div className="min-h-0">
           <MapMissionView
@@ -580,7 +739,7 @@ export function OmniVisApp() {
             selectedUavId={selectedUavId}
             simTimeS={simTimeS}
             onTriggerLoss={triggerLoss}
-            onPreviewLossResponse={setLossResponseMode}
+            onPreviewLossResponse={handleLossResponseModeChange}
             onForceRtbPreview={() => plan && setPlan(armRtbDemo(plan, simTimeS))}
             onHealthPing={() => plan && selectedUavId && setPlan(sendHealthPing(plan, selectedUavId, simTimeS))}
             onRegainSignal={() => plan && selectedUavId && setPlan(applySignalRegain(plan, selectedUavId, simTimeS))}

@@ -44,6 +44,7 @@ export function UnitCard({
   }
 
   const snapshot = getUavSnapshot(uav, simTimeS);
+  const fullSignal = plan.config.commsPolicy === "full_signal";
 
   return (
     <section className="shrink-0 border border-white/10 bg-neutral-950 p-3">
@@ -104,14 +105,15 @@ export function UnitCard({
           onClick={() => onPreviewLossResponse("dispatch_replacement")}
         >
           <ScanSearch className="size-3.5" />
-          Replacement Preview
+          Use Replacement
         </button>
         <button
-          className="inline-flex items-center justify-center gap-1.5 border border-white/10 bg-black px-2 py-2 text-xs font-semibold text-neutral-200 transition hover:border-white/25 hover:bg-white/5"
+          className="inline-flex items-center justify-center gap-1.5 border border-white/10 bg-black px-2 py-2 text-xs font-semibold text-neutral-200 transition hover:border-white/25 hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-35"
+          disabled={!fullSignal}
           onClick={() => onPreviewLossResponse("spread_remaining_swarm")}
         >
           <Shuffle className="size-3.5" />
-          Spread Preview
+          {fullSignal ? "Use Spread" : "Spread needs GPS"}
         </button>
         <button
           className="inline-flex items-center justify-center gap-1.5 border border-white/10 bg-black px-2 py-2 text-xs font-semibold text-neutral-200 transition hover:border-white/25 hover:bg-white/5"

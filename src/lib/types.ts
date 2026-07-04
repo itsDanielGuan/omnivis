@@ -19,11 +19,12 @@ export type DemoMode =
   | "nfz"
   | "rtb";
 
-export type CommsPolicy =
-  | "strict_silent"
-  | "radio_silent_except_tokens"
-  | "exception_tokens_plus_health"
-  | "full_signal";
+export type CommsPolicy = "silent_operation" | "full_signal";
+
+export type PathPattern =
+  | "sector_lanes"
+  | "alternating_lanes"
+  | "nearest_infill";
 
 export type LossResponseMode =
   | "dispatch_replacement"
@@ -82,6 +83,7 @@ export type MissionConfig = {
   stripAngleDeg: number;
   rtbSlotSpacingS: number;
   commsPolicy: CommsPolicy;
+  pathPattern: PathPattern;
   seed: number;
 };
 
@@ -108,6 +110,7 @@ export type PlanningArea = {
   groupId: string;
   polygon: Point[];
   linkedBaseId?: string;
+  backupBaseId?: string;
 };
 
 export type BaseWaypointMode = "nearest_safe" | "round_robin" | "specific";
@@ -122,6 +125,7 @@ export type HomeBase = {
   id: string;
   label: string;
   point: Point;
+  available?: boolean;
   outboundWaypoints: BaseWaypoint[];
   inboundWaypoints: BaseWaypoint[];
   waypointMode: BaseWaypointMode;
@@ -247,7 +251,7 @@ export type MissionPlan = {
   events: MissionEvent[];
   metrics: MissionMetrics;
   lossResponseMode: LossResponseMode;
-  activeContingency?: "vehicle_loss" | "nfz" | "rtb";
+  activeContingency?: "vehicle_loss" | "nfz" | "rtb" | "base_offline";
 };
 
 export type UavSnapshot = {

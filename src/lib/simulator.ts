@@ -15,11 +15,13 @@ import { UAV_COLORS } from "@/lib/presets";
 import { buildRouteFromStart } from "@/lib/planner";
 import {
   buildReturnRouteViaBaseWaypoint,
+  normalizeHomeBase,
   routeIntersectsAnyNfz,
   safePathLength,
 } from "@/lib/routing";
 import type {
   CoverageStrip,
+  HomeBase,
   LossResponseMode,
   MissionEvent,
   MissionMessage,
@@ -73,12 +75,13 @@ function addMessage(
   targetIds?: string[],
 ) {
   const countInMission = type !== "MISSION_LOAD";
-  if (plan.config.commsPolicy === "strict_silent" && countInMission) {
+  const silentAllowsMessage = type === "HEALTH_EPOCH" || type === "HEALTH_MISS";
+  if (plan.config.commsPolicy === "silent_operation" && countInMission && !silentAllowsMessage) {
     addEvent(
       plan,
       timeS,
       "info",
-      `${text}; precompiled branch activated locally without live transmission`,
+      `${text}; silent operation kept GPS and command traffic off-net`,
       sourceId,
     );
     return;
@@ -163,6 +166,21 @@ function stripTraverseFrom(cursor: Point, strip: CoverageStrip, plan: MissionPla
   };
 }
 
+function unfinishedRedistributionStrips(
+  plan: MissionPlan,
+  sourcePlan: MissionPlan,
+  timeS: number,
+): CoverageStrip[] {
+  return plan.strips
+    .filter((strip) => {
+      if (strip.status === "blocked_by_nfz") return false;
+      const sourceOwner = sourcePlan.uavs.find((uav) => uav.id === strip.assignedUavId);
+      if (!sourceOwner) return strip.status === "coverage_debt";
+      return stripCompletionTime(sourceOwner.originalRoute ?? sourceOwner.route, strip.id) > timeS;
+    })
+    .sort((a, b) => a.order - b.order);
+}
+
 function redistributeRemainingStripsGreedy(
   plan: MissionPlan,
   sourcePlan: MissionPlan,
@@ -171,14 +189,7 @@ function redistributeRemainingStripsGreedy(
 ): Map<string, CoverageStrip[]> {
   if (activeUavs.length === 0) return new Map();
   const activeIds = new Set(activeUavs.map((uav) => uav.id));
-  const remaining = plan.strips
-    .filter((strip) => {
-      if (strip.status === "blocked_by_nfz") return false;
-      const sourceOwner = sourcePlan.uavs.find((uav) => uav.id === strip.assignedUavId);
-      if (!sourceOwner) return strip.status === "coverage_debt";
-      return stripCompletionTime(sourceOwner.originalRoute ?? sourceOwner.route, strip.id) > timeS;
-    })
-    .sort((a, b) => a.order - b.order);
+  const remaining = unfinishedRedistributionStrips(plan, sourcePlan, timeS);
 
   const buckets = activeUavs.map((uav, index) => ({
     uav,
@@ -214,6 +225,32 @@ function redistributeRemainingStripsGreedy(
   });
 
   return new Map(buckets.map((bucket) => [bucket.uav.id, bucket.strips]));
+}
+
+function redistributeRemainingStripsBySector(
+  plan: MissionPlan,
+  sourcePlan: MissionPlan,
+  activeUavs: UavPlan[],
+  timeS: number,
+): Map<string, CoverageStrip[]> {
+  if (activeUavs.length === 0) return new Map();
+
+  const remaining = unfinishedRedistributionStrips(plan, sourcePlan, timeS);
+  const sectorSize = Math.max(1, Math.ceil(remaining.length / activeUavs.length));
+  const buckets = new Map<string, CoverageStrip[]>(
+    activeUavs.map((uav) => [uav.id, []]),
+  );
+
+  remaining.forEach((strip, index) => {
+    const owner = activeUavs[Math.min(activeUavs.length - 1, Math.floor(index / sectorSize))];
+    const mutableStrip = plan.strips.find((candidate) => candidate.id === strip.id);
+    if (!owner || !mutableStrip) return;
+    mutableStrip.status = "planned";
+    mutableStrip.assignedUavId = owner.id;
+    buckets.get(owner.id)?.push(mutableStrip);
+  });
+
+  return buckets;
 }
 
 export function getUavSnapshot(
@@ -407,7 +444,10 @@ export function applyVehicleLoss(
       replacementId,
     );
   } else {
-    const workByUav = redistributeRemainingStripsGreedy(plan, sourcePlan, activeUavs, timeS);
+    const nearestInfill = plan.config.pathPattern === "nearest_infill";
+    const workByUav = nearestInfill
+      ? redistributeRemainingStripsGreedy(plan, sourcePlan, activeUavs, timeS)
+      : redistributeRemainingStripsBySector(plan, sourcePlan, activeUavs, timeS);
 
     activeUavs.forEach((uav, index) => {
       const future = workByUav.get(uav.id) ?? pendingAssignedStrips(plan, uav, timeS);
@@ -422,7 +462,9 @@ export function applyVehicleLoss(
       timeS + 10,
       "SWARM_REDISTRIBUTE",
       "BASE",
-      "Full-signal loss: remaining strips redistributed from current UAV positions",
+      nearestInfill
+        ? "Full-signal loss: nearest-infill spread redistributed strips from current UAV positions"
+        : "Full-signal loss: sector-lane spread redistributed contiguous remaining zones",
       undefined,
       activeUavs.map((uav) => uav.id),
     );
@@ -430,7 +472,9 @@ export function applyVehicleLoss(
       plan,
       timeS + 15,
       "warning",
-      `Greedy spread rebalanced unfinished strips across ${activeUavs.map((uav) => uav.label).join(", ")}`,
+      nearestInfill
+        ? `Nearest-infill spread rebalanced unfinished strips across ${activeUavs.map((uav) => uav.label).join(", ")}`
+        : `Sector spread redivided unfinished coverage zones across ${activeUavs.map((uav) => uav.label).join(", ")}`,
     );
   }
 
@@ -453,7 +497,7 @@ export function applyNfz(
   };
   plan.activeContingency = "nfz";
 
-  const timeS = Math.max(60, requestedTimeS);
+  const timeS = Math.max(0, requestedTimeS);
   const source =
     plan.uavs.find((uav) => uav.id === sourceUavId && uav.status !== "lost") ??
     plan.uavs.find((uav) => uav.status !== "lost");
@@ -524,6 +568,65 @@ export function applyNfz(
     "danger",
     `${nfz.id} placed; ${blocked.length} strip envelopes blocked and affected routes detoured`,
     source?.id,
+  );
+
+  plan.metrics = computeMissionMetrics(plan);
+  return plan;
+}
+
+export function applyBaseOfflineFailover(
+  sourcePlan: MissionPlan,
+  offlineBaseId: string,
+  backupBase: HomeBase,
+  requestedTimeS: number,
+): MissionPlan {
+  const plan = clonePlan(sourcePlan);
+  const previousBase = plan.homeBase;
+  const nextBase = normalizeHomeBase(backupBase);
+  const timeS = Math.max(0, requestedTimeS);
+
+  if (previousBase.id !== offlineBaseId || nextBase.id === offlineBaseId) {
+    return plan;
+  }
+
+  plan.metrics.before = {
+    coveragePct: sourcePlan.metrics.coveragePct,
+    missionCompletionTimeS: sourcePlan.metrics.missionCompletionTimeS,
+    messagesUsed: sourcePlan.metrics.messagesUsed,
+    coverageDebtStripCount: sourcePlan.metrics.coverageDebtStripCount,
+  };
+  plan.activeContingency = "base_offline";
+  plan.homeBase = { ...nextBase, available: true };
+  plan.base = nextBase.point;
+
+  let replannedCount = 0;
+  plan.uavs
+    .filter((uav) => uav.status !== "lost")
+    .forEach((uav, index) => {
+      const routeEndS = uav.route.at(-1)?.t ?? 0;
+      if (timeS >= routeEndS - 1) return;
+
+      const replanTimeS = timeS + index * 3;
+      if (replanTimeS >= routeEndS - 1) return;
+      const future = pendingAssignedStrips(plan, uav, replanTimeS).sort(
+        (a, b) => a.order - b.order,
+      );
+      uav.status = uav.status === "regained" ? "regained" : "replanned";
+      buildContinuationForUav(plan, uav, future, replanTimeS, index, timeS + 360);
+      replannedCount += 1;
+    });
+
+  addEvent(
+    plan,
+    timeS,
+    "warning",
+    `${previousBase.label} went offline; ${nextBase.label} activated for all unfinished landings`,
+  );
+  addEvent(
+    plan,
+    timeS + 3,
+    "info",
+    `${replannedCount} airborne UAV${replannedCount === 1 ? "" : "s"} kept assigned work and rerouted RTB to ${nextBase.label}`,
   );
 
   plan.metrics = computeMissionMetrics(plan);

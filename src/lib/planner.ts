@@ -101,6 +101,59 @@ function assignStrips(strips: CoverageStrip[], config: MissionConfig): CoverageS
   });
 }
 
+function stripTraverseCost(
+  cursor: Point,
+  strip: CoverageStrip,
+  nfzs: Nfz[],
+  uavIndex: number,
+) {
+  const enterStartCost = safePathLength(cursor, strip.start, nfzs, uavIndex);
+  const enterEndCost = safePathLength(cursor, strip.end, nfzs, uavIndex);
+  const startsAtA = enterStartCost <= enterEndCost;
+  return {
+    exit: startsAtA ? strip.end : strip.start,
+    cost: Math.min(enterStartCost, enterEndCost) + distance(strip.start, strip.end),
+  };
+}
+
+export function orderCoverageStripsForPathPattern(
+  strips: CoverageStrip[],
+  config: MissionConfig,
+  start: Point,
+  uavIndex: number,
+  nfzs: Nfz[] = [],
+): CoverageStrip[] {
+  const ordered = [...strips].sort((a, b) => a.order - b.order);
+  const pattern = config.pathPattern ?? "sector_lanes";
+
+  if (pattern === "alternating_lanes") {
+    return uavIndex % 2 === 0 ? ordered : ordered.reverse();
+  }
+
+  if (pattern !== "nearest_infill") return ordered;
+
+  const pending = [...ordered];
+  const result: CoverageStrip[] = [];
+  let cursor = start;
+
+  while (pending.length > 0) {
+    let bestIndex = 0;
+    let best = stripTraverseCost(cursor, pending[0], nfzs, uavIndex);
+    pending.forEach((strip, index) => {
+      const candidate = stripTraverseCost(cursor, strip, nfzs, uavIndex);
+      if (candidate.cost < best.cost) {
+        best = candidate;
+        bestIndex = index;
+      }
+    });
+    const [next] = pending.splice(bestIndex, 1);
+    result.push(next);
+    cursor = best.exit;
+  }
+
+  return result;
+}
+
 function buildCoverageRoute(
   start: Point,
   startTimeS: number,
@@ -111,6 +164,7 @@ function buildCoverageRoute(
   nfzs: Nfz[] = [],
   homeBase?: HomeBase,
 ): RouteBuildResult {
+  const orderedStrips = orderCoverageStripsForPathPattern(strips, config, start, uavIndex, nfzs);
   const route: RouteWaypoint[] = [waypoint(start, startTimeS, includeLaunch ? "preflight" : "transit")];
   let coverageTimeS = 0;
 
@@ -123,7 +177,7 @@ function buildCoverageRoute(
       label: "staggered launch corridor",
     });
 
-    const firstSectorTarget = strips[0]?.center ?? launchPoint;
+    const firstSectorTarget = orderedStrips[0]?.center ?? launchPoint;
     if (homeBase) {
       const outbound = selectBaseWaypoint({
         base: homeBase,
@@ -141,7 +195,7 @@ function buildCoverageRoute(
     }
   }
 
-  strips.forEach((strip, idx) => {
+  orderedStrips.forEach((strip, idx) => {
     const current = route[route.length - 1];
     const startsAtA = distance(current, strip.start) <= distance(current, strip.end);
     const entry = startsAtA ? strip.start : strip.end;
@@ -175,35 +229,38 @@ function appendRtb(
   nfzs: Nfz[] = [],
 ) {
   const base = homeBase.point;
+  const current = route[route.length - 1] ?? base;
   const hold = {
     x: base.x - 300 - uavIndex * 30,
     y: base.y + (uavIndex - 2) * 210,
   };
-  appendSafeLeg(route, hold, config.speedMps, "transit", nfzs, uavIndex, {
-    label: "return corridor entry",
-  });
   const inbound = selectBaseWaypoint({
     base: homeBase,
     direction: "inbound",
-    from: hold,
+    from: current,
     to: base,
     nfzs,
     uavIndex,
   });
-  const returnDistance = inbound
-    ? safePathLength(hold, inbound.point, nfzs, uavIndex) +
-      safePathLength(inbound.point, base, nfzs, uavIndex)
-    : safePathLength(hold, base, nfzs, uavIndex);
-  const returnTime = returnDistance / config.speedMps;
-  const latestHoldDeparture = Math.max(route[route.length - 1].t, desiredArrivalS - returnTime);
-  if (latestHoldDeparture > route[route.length - 1].t + 1) {
-    route.push(waypoint(hold, latestHoldDeparture, "loiter", { label: "RTB slot hold" }));
-  }
+
   if (inbound) {
     appendSafeLeg(route, inbound.point, config.speedMps, "transit", nfzs, uavIndex, {
-      label: `inbound waypoint ${inbound.label}`,
+      label: `return via inbound waypoint ${inbound.label}`,
     });
+  } else {
+    appendSafeLeg(route, hold, config.speedMps, "transit", nfzs, uavIndex, {
+      label: "return corridor entry",
+    });
+    const finalLegTime = safePathLength(hold, base, nfzs, uavIndex) / config.speedMps;
+    const latestHoldDeparture = Math.max(
+      route[route.length - 1].t,
+      desiredArrivalS - finalLegTime,
+    );
+    if (latestHoldDeparture > route[route.length - 1].t + 1) {
+      route.push(waypoint(hold, latestHoldDeparture, "loiter", { label: "RTB slot hold" }));
+    }
   }
+
   appendSafeLeg(route, base, config.speedMps, "return", nfzs, uavIndex, {
     label: "RTB slot arrival",
   });

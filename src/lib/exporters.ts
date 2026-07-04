@@ -131,6 +131,7 @@ export function buildMissionArtifacts(plan: MissionPlan): MissionArtifact[] {
       homeBase: {
         id: plan.homeBase.id,
         label: plan.homeBase.label,
+        available: plan.homeBase.available !== false,
         waypointMode: plan.homeBase.waypointMode,
         specificOutboundWaypointId: plan.homeBase.specificOutboundWaypointId,
         specificInboundWaypointId: plan.homeBase.specificInboundWaypointId,
@@ -164,12 +165,14 @@ export function buildMissionArtifacts(plan: MissionPlan): MissionArtifact[] {
     vehicleLoss: {
       activeMode: plan.lossResponseMode,
       dispatchReplacement:
-        "Silent policies redo the lost UAV sector from base; full-signal policy continues from the last GPS point.",
+        "Silent operation redoes the lost UAV sector from base; full-signal operation continues from the last GPS point.",
       spreadRemainingSwarm:
-        "In full-signal policy, unfinished strips are greedily redistributed from active UAV current positions using NFZ-safe routing and workload balancing.",
+        plan.config.pathPattern === "nearest_infill"
+          ? "In full-signal operation, unfinished strips use nearest-infill redistribution from active UAV current positions."
+          : "In full-signal operation, unfinished strips are redistributed as contiguous coverage zones.",
     },
     popUpNfz:
-      "Detecting UAV locally detours around the hazard; exception-token mode emits one sparse NFZ token so peers recompute the same branch.",
+      "Live NFZ updates block intersecting strips and trigger NFZ-safe replans for affected future route legs.",
     rtb:
       "Return-to-base arrival windows are staggered in the mission contract and reinforced with hold points before the final corridor.",
   };
