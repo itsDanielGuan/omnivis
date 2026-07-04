@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { formatClock } from "@/lib/geometry";
 import { getCurrentTask, getUavSnapshot } from "@/lib/simulator";
-import type { MissionPlan } from "@/lib/types";
+import type { MissionPlan, UavPlan } from "@/lib/types";
 
 type Props = {
   plan: MissionPlan | null;
@@ -45,6 +45,65 @@ function MetricCard({
         <Icon className="size-4 text-neutral-500" />
       </div>
       <div className={`font-mono text-2xl font-semibold ${toneClass}`}>{value}</div>
+    </div>
+  );
+}
+
+function clampPct(value: number) {
+  return Math.max(0, Math.min(100, value));
+}
+
+function uavStatusTone(uav: UavPlan, simTimeS: number) {
+  const communicationLostAtS = uav.communicationLostAtS;
+  const lossDetectedAtS = uav.lossDetectedAtS ?? uav.lostAtS;
+  if (
+    uav.status === "lost" &&
+    communicationLostAtS !== undefined &&
+    lossDetectedAtS !== undefined &&
+    simTimeS >= communicationLostAtS &&
+    simTimeS < lossDetectedAtS
+  ) {
+    return "#f59e0b";
+  }
+  return uav.status === "lost" ? "#ef4444" : uav.color;
+}
+
+function UavStatusTimeline({ uav }: { uav: UavPlan }) {
+  const routeEndS = Math.max(1, uav.originalRoute?.at(-1)?.t ?? uav.route.at(-1)?.t ?? 1);
+  const communicationLostAtS = uav.communicationLostAtS;
+  const lossDetectedAtS = uav.lossDetectedAtS ?? uav.lostAtS;
+
+  if (communicationLostAtS === undefined || lossDetectedAtS === undefined) {
+    return (
+      <div className="mt-1">
+        <div className="h-1.5 w-full bg-sky-500" />
+        <div className="mt-1 font-mono text-[10px] uppercase text-neutral-600">Nominal 100%</div>
+      </div>
+    );
+  }
+
+  const nominalPct = clampPct((communicationLostAtS / routeEndS) * 100);
+  const detectedPct = clampPct((lossDetectedAtS / routeEndS) * 100);
+  const communicationPct = Math.max(0, detectedPct - nominalPct);
+  const lostPct = Math.max(0, 100 - detectedPct);
+
+  return (
+    <div className="mt-1">
+      <div
+        className="flex h-1.5 w-full overflow-hidden bg-neutral-900"
+        title={`Nominal ${nominalPct.toFixed(0)}%, communication loss ${communicationPct.toFixed(0)}%, drone loss ${lostPct.toFixed(0)}%`}
+      >
+        {nominalPct > 0 ? <span className="bg-sky-500" style={{ width: `${nominalPct}%` }} /> : null}
+        {communicationPct > 0 ? (
+          <span className="bg-amber-500" style={{ width: `${communicationPct}%` }} />
+        ) : null}
+        {lostPct > 0 ? <span className="bg-red-500" style={{ width: `${lostPct}%` }} /> : null}
+      </div>
+      <div className="mt-1 flex items-center gap-2 font-mono text-[10px] uppercase text-neutral-600">
+        <span>Nom {nominalPct.toFixed(0)}%</span>
+        <span>Comms {communicationPct.toFixed(0)}%</span>
+        <span>Lost {lostPct.toFixed(0)}%</span>
+      </div>
     </div>
   );
 }
@@ -151,7 +210,7 @@ export function MetricsPanel({ plan, simTimeS, selectedUavId, onSelectUav }: Pro
               >
                 <span
                   className="mt-1 size-2.5"
-                  style={{ backgroundColor: uav.status === "lost" ? "#ef4444" : uav.color }}
+                  style={{ backgroundColor: uavStatusTone(uav, simTimeS) }}
                 />
                 <span>
                   <span className="block text-sm font-semibold text-neutral-100">
@@ -160,6 +219,7 @@ export function MetricsPanel({ plan, simTimeS, selectedUavId, onSelectUav }: Pro
                   <span className="block truncate text-xs text-neutral-500">
                     {getCurrentTask(uav, simTimeS)}
                   </span>
+                  <UavStatusTimeline uav={uav} />
                 </span>
                 <span className="text-right font-mono text-xs text-neutral-300">
                   {Math.round(snapshot.progressPct)}%

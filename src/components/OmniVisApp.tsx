@@ -33,32 +33,26 @@ import type {
   PlanningArea,
   PlanningNfz,
   Point,
-  PolygonGroup,
 } from "@/lib/types";
 
 type PersistedPlanningState = {
   version: 1;
-  polygonGroups: PolygonGroup[];
   areas: PlanningArea[];
   homeBases: HomeBase[];
   planningNfzs: PlanningNfz[];
-  activeGroupId: string;
 };
 
 type EditorFeatureKind = "area" | "base" | "nfz" | "waypoint";
 
 const STORAGE_KEY = "omnivis.planning-state.v1";
-const DEFAULT_GROUP: PolygonGroup = { id: "group-1", label: "Group 1" };
 
 function initialPlanningState(): PersistedPlanningState {
   return (
     readPersistedState() ?? {
       version: 1,
-      polygonGroups: [DEFAULT_GROUP],
       areas: [],
       homeBases: [],
       planningNfzs: [],
-      activeGroupId: DEFAULT_GROUP.id,
     }
   );
 }
@@ -77,10 +71,28 @@ function shiftPolygon(polygon: Point[], delta: Point, vertexIndex?: number): Poi
   });
 }
 
-function normalizePlanningArea(area: PlanningArea): PlanningArea {
+function normalizePlanningArea(area: Partial<PlanningArea>): PlanningArea {
+  const linkedBaseId =
+    typeof area.linkedBaseId === "string" ? area.linkedBaseId : undefined;
+  const backupBaseId =
+    typeof area.backupBaseId === "string" && area.backupBaseId !== linkedBaseId
+      ? area.backupBaseId
+      : undefined;
   return {
-    ...area,
-    backupBaseId: area.backupBaseId === area.linkedBaseId ? undefined : area.backupBaseId,
+    id: typeof area.id === "string" ? area.id : makeId("area"),
+    label: typeof area.label === "string" ? area.label : "Fly Zone",
+    polygon: Array.isArray(area.polygon) ? area.polygon : [],
+    linkedBaseId,
+    backupBaseId,
+  };
+}
+
+function normalizePlanningNfz(nfz: Partial<PlanningNfz>): PlanningNfz {
+  return {
+    id: typeof nfz.id === "string" ? nfz.id : makeId("nfz"),
+    label: typeof nfz.label === "string" ? nfz.label : "NFZ",
+    polygon: Array.isArray(nfz.polygon) ? nfz.polygon : [],
+    enabled: nfz.enabled !== false,
   };
 }
 
@@ -137,12 +149,10 @@ function readPersistedState(): PersistedPlanningState | null {
     const parsed = JSON.parse(raw) as PersistedPlanningState;
     if (parsed.version !== 1) return null;
     return {
-      ...parsed,
-      polygonGroups: parsed.polygonGroups?.length ? parsed.polygonGroups : [DEFAULT_GROUP],
+      version: 1,
       areas: (parsed.areas ?? []).map((area) => normalizePlanningArea(area)),
       homeBases: (parsed.homeBases ?? []).map((base) => normalizeHomeBase(base)),
-      planningNfzs: parsed.planningNfzs ?? [],
-      activeGroupId: parsed.activeGroupId ?? DEFAULT_GROUP.id,
+      planningNfzs: (parsed.planningNfzs ?? []).map((nfz) => normalizePlanningNfz(nfz)),
     };
   } catch {
     return null;
@@ -156,10 +166,6 @@ export function OmniVisApp() {
   const [lossResponseMode, setLossResponseMode] =
     useState<LossResponseMode>("dispatch_replacement");
   const [editorMode, setEditorMode] = useState<EditorMode>("select");
-  const [polygonGroups, setPolygonGroups] = useState<PolygonGroup[]>(
-    initialState.polygonGroups.length ? initialState.polygonGroups : [DEFAULT_GROUP],
-  );
-  const [activeGroupId, setActiveGroupId] = useState(initialState.activeGroupId);
   const [areas, setAreas] = useState<PlanningArea[]>(initialState.areas);
   const [homeBases, setHomeBases] = useState<HomeBase[]>(initialState.homeBases);
   const [planningNfzs, setPlanningNfzs] = useState<PlanningNfz[]>(initialState.planningNfzs);
@@ -184,14 +190,12 @@ export function OmniVisApp() {
   useEffect(() => {
     const payload: PersistedPlanningState = {
       version: 1,
-      polygonGroups,
       areas,
       homeBases,
       planningNfzs,
-      activeGroupId,
     };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-  }, [activeGroupId, areas, homeBases, planningNfzs, polygonGroups]);
+  }, [areas, homeBases, planningNfzs]);
 
   useEffect(() => {
     if (!isRunning) return;
@@ -235,9 +239,11 @@ export function OmniVisApp() {
     const backupBaseForArea = area.backupBaseId
       ? homeBases.find((candidate) => candidate.id === area.backupBaseId)
       : undefined;
-    const nfzs = planningNfzs.map((nfz, index) =>
-      planningNfzToMissionNfz(nfz.label || `NFZ_${index + 1}`, nfz.polygon, simTimeS),
-    );
+    const nfzs = planningNfzs
+      .filter((nfz) => nfz.enabled !== false)
+      .map((nfz, index) =>
+        planningNfzToMissionNfz(nfz.label || `NFZ_${index + 1}`, nfz.polygon, simTimeS),
+      );
     const nextPlan = generateMissionPlanFromArea(config, area.polygon, base, nfzs);
     if (
       primaryBase &&
@@ -361,8 +367,7 @@ export function OmniVisApp() {
     if (editorMode === "draw_area") {
       const area: PlanningArea = {
         id: makeId("area"),
-        label: `Area ${areas.length + 1}`,
-        groupId: activeGroupId,
+        label: `Fly Zone ${areas.length + 1}`,
         polygon,
         linkedBaseId: selectedBaseId,
       };
@@ -375,6 +380,7 @@ export function OmniVisApp() {
         id: makeId("nfz"),
         label: `NFZ ${planningNfzs.length + 1}`,
         polygon,
+        enabled: true,
       };
       setPlanningNfzs((current) => [...current, nfz]);
       setPlan((current) =>
@@ -388,39 +394,42 @@ export function OmniVisApp() {
     setEditorMode("select");
   };
 
-  const createGroup = () => {
-    const group: PolygonGroup = {
-      id: makeId("group"),
-      label: `Group ${polygonGroups.length + 1}`,
-    };
-    setPolygonGroups((current) => [...current, group]);
-    setActiveGroupId(group.id);
-  };
-
   const deleteSelected = () => {
     if (selectedAreaId) {
-      setAreas((current) => current.filter((area) => area.id !== selectedAreaId));
-      setSelectedAreaId(undefined);
+      deleteArea(selectedAreaId);
     } else if (selectedBaseId) {
-      setHomeBases((current) => current.filter((base) => base.id !== selectedBaseId));
-      setAreas((current) =>
-        current.map((area) =>
-          area.linkedBaseId === selectedBaseId || area.backupBaseId === selectedBaseId
-            ? {
-                ...area,
-                linkedBaseId:
-                  area.linkedBaseId === selectedBaseId ? undefined : area.linkedBaseId,
-                backupBaseId:
-                  area.backupBaseId === selectedBaseId ? undefined : area.backupBaseId,
-              }
-            : area,
-        ),
-      );
-      setSelectedBaseId(undefined);
+      deleteBase(selectedBaseId);
     } else if (selectedNfzId) {
-      setPlanningNfzs((current) => current.filter((nfz) => nfz.id !== selectedNfzId));
-      setSelectedNfzId(undefined);
+      deleteNfz(selectedNfzId);
     }
+  };
+
+  const deleteArea = (areaId: string) => {
+    setAreas((current) => current.filter((area) => area.id !== areaId));
+    if (selectedAreaId === areaId) setSelectedAreaId(undefined);
+    setPlan(null);
+  };
+
+  const deleteBase = (baseId: string) => {
+    setHomeBases((current) => current.filter((base) => base.id !== baseId));
+    setAreas((current) =>
+      current.map((area) =>
+        area.linkedBaseId === baseId || area.backupBaseId === baseId
+          ? {
+              ...area,
+              linkedBaseId: area.linkedBaseId === baseId ? undefined : area.linkedBaseId,
+              backupBaseId: area.backupBaseId === baseId ? undefined : area.backupBaseId,
+            }
+          : area,
+      ),
+    );
+    if (selectedBaseId === baseId) setSelectedBaseId(undefined);
+    setPlan(null);
+  };
+
+  const deleteNfz = (nfzId: string) => {
+    setPlanningNfzs((current) => current.filter((nfz) => nfz.id !== nfzId));
+    if (selectedNfzId === nfzId) setSelectedNfzId(undefined);
     setPlan(null);
   };
 
@@ -450,6 +459,72 @@ export function OmniVisApp() {
       }),
     );
     setPlan(null);
+  };
+
+  const renameArea = (areaId: string, label: string) => {
+    setAreas((current) =>
+      current.map((area) => (area.id === areaId ? { ...area, label } : area)),
+    );
+    setPlan(null);
+  };
+
+  const renameNfz = (nfzId: string, label: string) => {
+    setPlanningNfzs((current) =>
+      current.map((nfz) => (nfz.id === nfzId ? { ...nfz, label } : nfz)),
+    );
+    setPlan(null);
+  };
+
+  const renameBase = (baseId: string, label: string) => {
+    setHomeBases((current) =>
+      current.map((base) => (base.id === baseId ? { ...base, label } : base)),
+    );
+    setPlan(null);
+  };
+
+  const togglePlanningNfzEnabled = (nfzId: string) => {
+    const target = planningNfzs.find((nfz) => nfz.id === nfzId);
+    if (!target) return;
+    const enabling = target.enabled === false;
+    const nextPlanningNfzs = planningNfzs.map((nfz) =>
+      nfz.id === nfzId ? { ...nfz, enabled: enabling } : nfz,
+    );
+    setPlanningNfzs(nextPlanningNfzs);
+    setSelectedNfzId(nfzId);
+    setSelectedAreaId(undefined);
+    setSelectedBaseId(undefined);
+
+    if (!plan) return;
+    if (enabling) {
+      setPlan(applyNfz(plan, target.polygon, simTimeS, selectedUavId));
+      return;
+    }
+
+    const area = selectedArea ?? areas[0];
+    if (!area) {
+      setPlan(null);
+      return;
+    }
+    const base = resolveAreaHomeBase(area, homeBases, selectedBase);
+    if (!base) {
+      setPlan(null);
+      return;
+    }
+    const enabledNfzs = nextPlanningNfzs
+      .filter((nfz) => nfz.enabled !== false)
+      .map((nfz, index) =>
+        planningNfzToMissionNfz(nfz.label || `NFZ_${index + 1}`, nfz.polygon, simTimeS),
+      );
+    const nextPlan = generateMissionPlanFromArea(config, area.polygon, base, enabledNfzs);
+    nextPlan.lossResponseMode =
+      config.commsPolicy === "full_signal" ? lossResponseMode : "dispatch_replacement";
+    nextPlan.events.push({
+      id: `EVT_${String(nextPlan.events.length + 1).padStart(3, "0")}_NFZ_DISABLED`,
+      timeS: simTimeS,
+      severity: "info",
+      text: `${target.label} disabled; routes recalculated against remaining active NFZs`,
+    });
+    setPlan(nextPlan);
   };
 
   const toggleSelectedBaseAvailability = () => {
@@ -657,8 +732,6 @@ export function OmniVisApp() {
           demoMode={demoMode}
           lossResponseMode={lossResponseMode}
           editorMode={editorMode}
-          polygonGroups={polygonGroups}
-          activeGroupId={activeGroupId}
           areas={areas}
           homeBases={homeBases}
           planningNfzs={planningNfzs}
@@ -672,8 +745,6 @@ export function OmniVisApp() {
           onConfigChange={handleConfigChange}
           onDemoModeChange={handleDemoModeChange}
           onEditorModeChange={handleEditorModeChange}
-          onActiveGroupChange={setActiveGroupId}
-          onCreateGroup={createGroup}
           onSelectedAreaChange={(id) => {
             setSelectedAreaId(id);
             setSelectedNfzId(undefined);
@@ -695,6 +766,13 @@ export function OmniVisApp() {
           onDeleteSelected={deleteSelected}
           onLinkBaseToArea={linkBaseToArea}
           onLinkBackupBaseToArea={linkBackupBaseToArea}
+          onRenameArea={renameArea}
+          onRenameBase={renameBase}
+          onRenameNfz={renameNfz}
+          onDeleteArea={deleteArea}
+          onDeleteBase={deleteBase}
+          onDeleteNfz={deleteNfz}
+          onToggleNfzEnabled={togglePlanningNfzEnabled}
           onToggleBaseAvailability={toggleSelectedBaseAvailability}
           onAddBaseWaypoint={(direction) =>
             setEditorMode(direction === "outbound" ? "place_outbound_waypoint" : "place_inbound_waypoint")

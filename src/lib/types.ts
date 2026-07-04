@@ -99,15 +99,9 @@ export type MapPreset = {
   aooPolygons: Record<AooPresetId, Point[]>;
 };
 
-export type PolygonGroup = {
-  id: string;
-  label: string;
-};
-
 export type PlanningArea = {
   id: string;
   label: string;
-  groupId: string;
   polygon: Point[];
   linkedBaseId?: string;
   backupBaseId?: string;
@@ -137,6 +131,7 @@ export type PlanningNfz = {
   id: string;
   label: string;
   polygon: Point[];
+  enabled?: boolean;
 };
 
 export type CoverageStrip = {
@@ -171,6 +166,8 @@ export type UavPlan = {
   utilizationPct: number;
   coverageTimeS: number;
   reserve?: boolean;
+  communicationLostAtS?: number;
+  lossDetectedAtS?: number;
   lostAtS?: number;
   lossPoint?: Point;
   regainedAtS?: number;

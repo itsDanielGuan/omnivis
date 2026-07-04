@@ -9,9 +9,9 @@ import type {
   Popup as MapLibrePopup,
   StyleSpecification,
 } from "maplibre-gl";
-import { AlertTriangle, Crosshair, LocateFixed } from "lucide-react";
+import { AlertTriangle, Crosshair } from "lucide-react";
 import { closeRing, latLonToLocalMeters, pointsToLngLat, toLngLat } from "@/lib/geo";
-import { polygonCentroid } from "@/lib/geometry";
+import { distance, midpoint, polygonCentroid } from "@/lib/geometry";
 import { missionToGeoJson } from "@/lib/mapFeatures";
 import { normalizeHomeBase } from "@/lib/routing";
 import type { Feature, FeatureCollection } from "geojson";
@@ -181,13 +181,15 @@ function editorFeatures({
     if (!area.linkedBaseId) return;
     const linkedBase = normalizedHomeBases.find((base) => base.id === area.linkedBaseId);
     if (!linkedBase) return;
+    const areaCenter = polygonCentroid(area.polygon);
+    const distanceKm = distance(linkedBase.point, areaCenter) / 1000;
     features.push({
       type: "Feature",
       geometry: {
         type: "LineString",
         coordinates: [
           toLngLat(mapPreset, linkedBase.point),
-          toLngLat(mapPreset, polygonCentroid(area.polygon)),
+          toLngLat(mapPreset, areaCenter),
         ],
       },
       properties: {
@@ -200,19 +202,35 @@ function editorFeatures({
         selected: area.id === selectedAreaId || linkedBase.id === selectedBaseId,
       },
     });
+    features.push({
+      type: "Feature",
+      geometry: {
+        type: "Point",
+        coordinates: toLngLat(mapPreset, midpoint(linkedBase.point, areaCenter)),
+      },
+      properties: {
+        kind: "area_base_link_label",
+        entityKind: "link",
+        id: `${area.id}_${linkedBase.id}_distance`,
+        label: `${distanceKm.toFixed(distanceKm >= 10 ? 0 : 1)} km`,
+        selected: area.id === selectedAreaId || linkedBase.id === selectedBaseId,
+      },
+    });
   });
 
   areas.forEach((area) => {
     if (!area.backupBaseId) return;
     const backupBase = normalizedHomeBases.find((base) => base.id === area.backupBaseId);
     if (!backupBase) return;
+    const areaCenter = polygonCentroid(area.polygon);
+    const distanceKm = distance(backupBase.point, areaCenter) / 1000;
     features.push({
       type: "Feature",
       geometry: {
         type: "LineString",
         coordinates: [
           toLngLat(mapPreset, backupBase.point),
-          toLngLat(mapPreset, polygonCentroid(area.polygon)),
+          toLngLat(mapPreset, areaCenter),
         ],
       },
       properties: {
@@ -222,6 +240,20 @@ function editorFeatures({
         areaId: area.id,
         baseId: backupBase.id,
         label: `${backupBase.label} backup for ${area.label}`,
+        selected: area.id === selectedAreaId || backupBase.id === selectedBaseId,
+      },
+    });
+    features.push({
+      type: "Feature",
+      geometry: {
+        type: "Point",
+        coordinates: toLngLat(mapPreset, midpoint(backupBase.point, areaCenter)),
+      },
+      properties: {
+        kind: "area_base_link_label",
+        entityKind: "link",
+        id: `${area.id}_${backupBase.id}_backup_distance`,
+        label: `${distanceKm.toFixed(distanceKm >= 10 ? 0 : 1)} km`,
         selected: area.id === selectedAreaId || backupBase.id === selectedBaseId,
       },
     });
@@ -239,7 +271,6 @@ function editorFeatures({
         entityKind: "area",
         id: area.id,
         label: area.label,
-        groupId: area.groupId,
         linkedBaseId: area.linkedBaseId,
         backupBaseId: area.backupBaseId,
         selected: area.id === selectedAreaId,
@@ -272,6 +303,7 @@ function editorFeatures({
         entityKind: "nfz",
         id: nfz.id,
         label: nfz.label,
+        enabled: nfz.enabled !== false,
         selected: nfz.id === selectedNfzId,
       },
     });
@@ -437,6 +469,26 @@ function addMissionLayers(map: MapLibreMap) {
       },
     },
     {
+      id: "editor-link-label",
+      type: "symbol",
+      filter: ["==", ["get", "kind"], "area_base_link_label"],
+      layout: {
+        "text-field": ["get", "label"],
+        "text-size": 11,
+        "text-font": ["Open Sans Semibold", "Arial Unicode MS Bold"],
+        "text-allow-overlap": true,
+        "text-ignore-placement": true,
+        "text-rotation-alignment": "viewport",
+        "text-pitch-alignment": "viewport",
+      },
+      paint: {
+        "text-color": ["case", ["==", ["get", "selected"], true], "#f8fafc", "#d1fae5"],
+        "text-halo-color": "#020617",
+        "text-halo-width": 2,
+        "text-opacity": ["case", ["==", ["get", "selected"], true], 1, 0.86],
+      },
+    },
+    {
       id: "editor-area-fill",
       type: "fill",
       filter: ["in", ["get", "kind"], ["literal", ["planning_area", "draft_area"]]],
@@ -451,7 +503,14 @@ function addMissionLayers(map: MapLibreMap) {
       filter: ["in", ["get", "kind"], ["literal", ["planning_nfz", "draft_nfz"]]],
       paint: {
         "fill-color": "#ef4444",
-        "fill-opacity": ["case", ["==", ["get", "selected"], true], 0.24, 0.15],
+        "fill-opacity": [
+          "case",
+          ["==", ["get", "enabled"], false],
+          0.04,
+          ["==", ["get", "selected"], true],
+          0.24,
+          0.15,
+        ],
       },
     },
     {
@@ -479,7 +538,7 @@ function addMissionLayers(map: MapLibreMap) {
       paint: {
         "line-color": "#fb7185",
         "line-width": ["case", ["==", ["get", "selected"], true], 3, 2],
-        "line-opacity": 0.95,
+        "line-opacity": ["case", ["==", ["get", "enabled"], false], 0.28, 0.95],
       },
     },
     {
@@ -818,6 +877,24 @@ function fitPlan(map: MapLibreMap, plan: MissionPlan) {
   map.fitBounds(bounds, { padding: 90, duration: 850, maxZoom: 12.8 });
 }
 
+const THEATER_JUMPS = [
+  {
+    label: "Ukraine-Russia border",
+    center: { lat: 49.92, lon: 36.62 },
+    zoom: 6.4,
+  },
+  {
+    label: "Iran",
+    center: { lat: 32.45, lon: 53.68 },
+    zoom: 5.2,
+  },
+  {
+    label: "Palestine-Israel border",
+    center: { lat: 31.72, lon: 35.05 },
+    zoom: 8.1,
+  },
+] as const;
+
 export function MapMissionView({
   plan,
   mapPreset,
@@ -839,8 +916,10 @@ export function MapMissionView({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const planIdRef = useRef<string | null>(null);
+  const lastPresetIdRef = useRef(mapPreset.id);
   const nfzMarkersRef = useRef<Array<{ remove: () => void }>>([]);
   const popupRef = useRef<MapLibrePopup | null>(null);
+  const popupSuppressedUntilRef = useRef(0);
   const dragRef = useRef<{
     kind: EditorFeatureKind;
     id: string;
@@ -982,7 +1061,8 @@ export function MapMissionView({
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || plan) return;
+    if (!map || plan || lastPresetIdRef.current === mapPreset.id) return;
+    lastPresetIdRef.current = mapPreset.id;
     map.easeTo({
       center: [mapPreset.mapCenter.lon, mapPreset.mapCenter.lat],
       zoom: mapPreset.mapZoom,
@@ -1051,7 +1131,7 @@ export function MapMissionView({
         return {
           kind: "No-fly zone",
           label: (nfz?.label ?? label) || "Unnamed NFZ",
-          detail: "Restricted polygon",
+          detail: nfz?.enabled === false ? "Disabled polygon" : "Active restricted polygon",
         };
       }
       if (kind === "base_waypoint") {
@@ -1064,7 +1144,15 @@ export function MapMissionView({
       return null;
     };
 
+    const suppressEditorPopup = (durationMs = 350) => {
+      popupSuppressedUntilRef.current = performance.now() + durationMs;
+      popupRef.current?.remove();
+    };
+
+    const popupSuppressed = () => performance.now() < popupSuppressedUntilRef.current;
+
     const showEditorPopup = (event: MapMouseEvent, feature: Feature) => {
+      if (popupSuppressed()) return;
       const info = popupInfoForFeature(feature);
       if (!info || !popupRef.current) return;
       popupRef.current
@@ -1074,7 +1162,7 @@ export function MapMissionView({
     };
 
     const updateEditorPopup = (event: MapMouseEvent) => {
-      if (!loaded || editorMode !== "select" || dragRef.current) {
+      if (!loaded || editorMode !== "select" || dragRef.current || popupSuppressed()) {
         popupRef.current?.remove();
         return;
       }
@@ -1093,7 +1181,12 @@ export function MapMissionView({
 
     function handleClick(event: MapMouseEvent) {
       if (!map) return;
+      if (popupSuppressed()) {
+        popupRef.current?.remove();
+        return;
+      }
       if (dragRef.current?.moved) {
+        suppressEditorPopup();
         dragRef.current = null;
         return;
       }
@@ -1156,6 +1249,11 @@ export function MapMissionView({
           ? Number(editorFeature.properties.index)
           : undefined;
       onSelectEditorFeature(kind, id);
+      if (kind === "area" || kind === "nfz") {
+        suppressEditorPopup();
+      } else {
+        popupRef.current?.remove();
+      }
       dragRef.current = {
         kind,
         id,
@@ -1182,12 +1280,19 @@ export function MapMissionView({
       if (Math.hypot(delta.x, delta.y) < 0.1) return;
       drag.moved = true;
       drag.lastPoint = nextPoint;
+      if (drag.kind === "area" || drag.kind === "nfz") {
+        suppressEditorPopup();
+      }
       onMoveEditorFeature(drag.kind, drag.id, delta, drag.vertexIndex);
     }
 
     function handleMouseUp() {
-      if (!dragRef.current) return;
+      const drag = dragRef.current;
+      if (!drag) return;
       if (!map) return;
+      if (drag.moved && (drag.kind === "area" || drag.kind === "nfz")) {
+        suppressEditorPopup(500);
+      }
       map.dragPan.enable();
       map.getCanvas().style.cursor = editorMode === "select" ? "" : "crosshair";
       window.setTimeout(() => {
@@ -1350,30 +1455,39 @@ export function MapMissionView({
           ? "RTB SLOT VIEW ACTIVE"
           : null;
 
+  const jumpToTheater = (theater: (typeof THEATER_JUMPS)[number]) => {
+    const map = mapRef.current;
+    if (!map) return;
+    popupRef.current?.remove();
+    map.easeTo({
+      center: [theater.center.lon, theater.center.lat],
+      zoom: theater.zoom,
+      pitch: 0,
+      bearing: 0,
+      duration: 700,
+    });
+  };
+
   return (
     <section className="relative h-full min-h-0 overflow-hidden bg-neutral-950">
       <div className="absolute inset-0">
         <div ref={containerRef} className="h-full w-full" />
       </div>
-      <div className="pointer-events-none absolute left-3 top-3 max-w-[15rem] border border-white/10 bg-black/78 p-3 text-xs text-neutral-300 shadow-xl backdrop-blur">
-        <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-neutral-100">
-          <LocateFixed className="size-4 text-neutral-300" />
-          Theater Jump
-        </div>
-        <div className="grid gap-1.5">
-          <span className="border border-white/10 bg-white/5 px-2 py-1 text-neutral-200">
-            Ukraine-Russia border
-          </span>
-          <span className="border border-white/10 bg-white/5 px-2 py-1 text-neutral-200">
-            Iran theater
-          </span>
-          <span className="border border-white/10 bg-white/5 px-2 py-1 text-neutral-200">
-            Palestine-Israel border
-          </span>
-        </div>
-        <div className="mt-2 text-[10px] uppercase tracking-wide text-neutral-500">
-          Preset placeholder
-        </div>
+      <div className="absolute left-3 top-3 z-30 flex flex-wrap gap-2 text-xs font-semibold text-neutral-100">
+        {THEATER_JUMPS.map((theater) => (
+          <button
+            key={theater.label}
+            type="button"
+            className="border border-white/15 bg-black/75 px-2.5 py-1.5 shadow-lg backdrop-blur transition hover:bg-neutral-900 focus:border-sky-300/60 focus:outline-none"
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              jumpToTheater(theater);
+            }}
+          >
+            {theater.label}
+          </button>
+        ))}
       </div>
 
       {editorMode === "draw_area" ? (

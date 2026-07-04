@@ -1,10 +1,9 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import {
   AlertTriangle,
-  CheckCircle2,
   Crosshair,
-  File,
   Folder,
   Home,
   Link2,
@@ -20,7 +19,6 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { DEMO_MODES, MAP_PRESETS } from "@/lib/presets";
 import type {
   BaseWaypointMode,
   CommsPolicy,
@@ -32,16 +30,22 @@ import type {
   PathPattern,
   PlanningArea,
   PlanningNfz,
-  PolygonGroup,
 } from "@/lib/types";
+
+type ActionMenu =
+  | {
+      kind: "area" | "base" | "nfz";
+      id: string;
+      x: number;
+      y: number;
+    }
+  | null;
 
 type Props = {
   config: MissionConfig;
   demoMode: DemoMode;
   lossResponseMode: LossResponseMode;
   editorMode: EditorMode;
-  polygonGroups: PolygonGroup[];
-  activeGroupId: string;
   areas: PlanningArea[];
   homeBases: HomeBase[];
   planningNfzs: PlanningNfz[];
@@ -55,8 +59,6 @@ type Props = {
   onConfigChange: (next: MissionConfig) => void;
   onDemoModeChange: (mode: DemoMode) => void;
   onEditorModeChange: (mode: EditorMode) => void;
-  onActiveGroupChange: (groupId: string) => void;
-  onCreateGroup: () => void;
   onSelectedAreaChange: (areaId: string | undefined) => void;
   onSelectedBaseChange: (baseId: string | undefined) => void;
   onSelectedNfzChange: (nfzId: string | undefined) => void;
@@ -65,6 +67,13 @@ type Props = {
   onDeleteSelected: () => void;
   onLinkBaseToArea: () => void;
   onLinkBackupBaseToArea: () => void;
+  onRenameArea: (areaId: string, label: string) => void;
+  onRenameBase: (baseId: string, label: string) => void;
+  onRenameNfz: (nfzId: string, label: string) => void;
+  onDeleteArea: (areaId: string) => void;
+  onDeleteBase: (baseId: string) => void;
+  onDeleteNfz: (nfzId: string) => void;
+  onToggleNfzEnabled: (nfzId: string) => void;
   onToggleBaseAvailability: () => void;
   onAddBaseWaypoint: (direction: "outbound" | "inbound") => void;
   onBaseWaypointModeChange: (mode: BaseWaypointMode) => void;
@@ -120,11 +129,8 @@ function commandButton(active: boolean) {
 
 export function MissionControls({
   config,
-  demoMode,
   lossResponseMode,
   editorMode,
-  polygonGroups,
-  activeGroupId,
   areas,
   homeBases,
   planningNfzs,
@@ -136,10 +142,7 @@ export function MissionControls({
   canDeleteSelected,
   canTriggerSelectedLoss,
   onConfigChange,
-  onDemoModeChange,
   onEditorModeChange,
-  onActiveGroupChange,
-  onCreateGroup,
   onSelectedAreaChange,
   onSelectedBaseChange,
   onSelectedNfzChange,
@@ -148,6 +151,13 @@ export function MissionControls({
   onDeleteSelected,
   onLinkBaseToArea,
   onLinkBackupBaseToArea,
+  onRenameArea,
+  onRenameBase,
+  onRenameNfz,
+  onDeleteArea,
+  onDeleteBase,
+  onDeleteNfz,
+  onToggleNfzEnabled,
   onToggleBaseAvailability,
   onAddBaseWaypoint,
   onBaseWaypointModeChange,
@@ -176,6 +186,42 @@ export function MissionControls({
     config.commsPolicy === "full_signal" ? "full_signal" : "silent_operation";
   const spreadAvailable = operationMode === "full_signal";
   const pathPattern = config.pathPattern ?? "sector_lanes";
+  const [actionMenu, setActionMenu] = useState<ActionMenu>(null);
+
+  useEffect(() => {
+    if (!actionMenu) return;
+    const close = () => setActionMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [actionMenu]);
+
+  const openActionMenu = (
+    kind: "area" | "base" | "nfz",
+    id: string,
+    event: React.MouseEvent<HTMLButtonElement>,
+  ) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const width = 136;
+    const height = kind === "nfz" ? 116 : 84;
+    const x = Math.max(8, Math.min(window.innerWidth - width - 8, rect.right - width));
+    const below = rect.bottom + 6;
+    const y =
+      below + height > window.innerHeight - 8
+        ? Math.max(8, rect.top - height - 6)
+        : below;
+    setActionMenu({ kind, id, x, y });
+  };
+
+  const closeActionMenu = () => setActionMenu(null);
 
   return (
     <aside className="flex min-h-0 flex-col border-r border-white/10 bg-black">
@@ -285,182 +331,78 @@ export function MissionControls({
       </div>
 
       <div className="border border-white/10 bg-neutral-950 p-3">
-        <div className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-neutral-200">
-          <Folder className="size-4 text-neutral-400" />
-          Mission Files
-        </div>
-        <div className="mb-3 grid grid-cols-[1fr_auto] gap-2">
-          <div className="border border-white/10 bg-black px-2 py-2 text-xs text-neutral-400">
-            New fly areas save into{" "}
-            <span className="font-semibold text-neutral-100">
-              {polygonGroups.find((group) => group.id === activeGroupId)?.label ?? "Group 1"}
-            </span>
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-neutral-200">
+            <Folder className="size-4 text-neutral-400" />
+            Mission Files
           </div>
-          <button
-            className="inline-flex items-center justify-center border border-white/10 bg-neutral-900 px-2 text-neutral-100 transition hover:bg-neutral-800"
-            onClick={onCreateGroup}
-            aria-label="Create polygon group"
-          >
-            <Plus className="size-4" />
-          </button>
+          <span className="font-mono text-[10px] uppercase tracking-wide text-neutral-500">
+            {areas.length + homeBases.length + planningNfzs.length} items
+          </span>
         </div>
-        <div className="max-h-64 overflow-y-auto border border-white/10 bg-black p-1 text-xs">
-          {polygonGroups.map((group) => {
-            const groupAreas = areas.filter((area) => area.groupId === group.id);
-            const active = group.id === activeGroupId;
-            return (
-              <div key={group.id} className="mb-1 last:mb-0">
-                <button
-                  className={`flex w-full items-center justify-between gap-2 px-2 py-1.5 text-left transition ${
-                    active ? "bg-white/10 text-neutral-100" : "text-neutral-300 hover:bg-white/5"
-                  }`}
-                  onClick={() => onActiveGroupChange(group.id)}
-                >
-                  <span className="flex min-w-0 items-center gap-2">
-                    <Folder className="size-3.5 shrink-0 text-sky-300" />
-                    <span className="truncate">{group.label}</span>
-                  </span>
-                  <span className="font-mono text-[10px] text-neutral-500">
-                    {groupAreas.length}
-                  </span>
-                </button>
-                <div className="ml-3 border-l border-white/10 pl-2">
-                  {groupAreas.length === 0 ? (
-                    <div className="px-2 py-1.5 text-neutral-600">No fly areas</div>
-                  ) : (
-                    groupAreas.map((area) => {
-                      const areaLinkedBase = area.linkedBaseId
-                        ? homeBases.find((base) => base.id === area.linkedBaseId)
-                        : undefined;
-                      const areaBackupBase = area.backupBaseId
-                        ? homeBases.find((base) => base.id === area.backupBaseId)
-                        : undefined;
-                      const selected = selectedAreaId === area.id;
-                      return (
-                        <button
-                          key={area.id}
-                          className={`grid w-full grid-cols-[1fr_auto] gap-2 px-2 py-1.5 text-left transition ${
-                            selected
-                              ? "bg-sky-400/15 text-sky-100"
-                              : "text-neutral-300 hover:bg-white/5"
-                          }`}
-                          onClick={() => onSelectedAreaChange(area.id)}
-                        >
-                          <span className="flex min-w-0 items-center gap-2">
-                            <File className="size-3.5 shrink-0 text-sky-300" />
-                            <span className="truncate">{area.label}</span>
-                          </span>
-                          <span
-                            className={`inline-flex min-w-0 items-center gap-1 text-[10px] ${
-                              areaLinkedBase ? "text-emerald-300" : "text-neutral-500"
-                            }`}
-                          >
-                            {areaLinkedBase ? <CheckCircle2 className="size-3" /> : null}
-                            <span className="truncate">
-                              {areaLinkedBase?.label ?? "No base"}
-                              {areaLinkedBase?.available === false ? " offline" : ""}
-                              {areaBackupBase ? ` / ${areaBackupBase.label} backup` : ""}
-                            </span>
-                          </span>
-                        </button>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-            );
-          })}
-
-          <div className="mt-2 border-t border-white/10 pt-1">
-            <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">
-              Home bases
+        <div className="max-h-96 space-y-3 overflow-y-auto text-xs">
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between px-1 text-[10px] font-semibold uppercase tracking-wide text-sky-300/80">
+              <span>Normal zones</span>
+              <span className="font-mono text-neutral-500">{areas.length}</span>
             </div>
-            {homeBases.length === 0 ? (
-              <div className="px-2 py-1.5 text-neutral-600">No home bases</div>
+            {areas.length === 0 ? (
+              <div className="border border-white/10 bg-black px-2 py-2 text-neutral-600">
+                No normal zones yet.
+              </div>
             ) : (
-              homeBases.map((base) => {
-                const selected = selectedBaseId === base.id;
+              areas.map((area) => {
+                const primaryBase = area.linkedBaseId
+                  ? homeBases.find((base) => base.id === area.linkedBaseId)
+                  : undefined;
+                const backup = area.backupBaseId
+                  ? homeBases.find((base) => base.id === area.backupBaseId)
+                  : undefined;
+                const selected = selectedAreaId === area.id;
                 return (
-                  <div key={base.id} className="mb-1 last:mb-0">
-                    <button
-                      className={`flex w-full items-center justify-between gap-2 px-2 py-1.5 text-left transition ${
-                        selected
-                          ? "bg-emerald-400/15 text-emerald-100"
-                          : "text-neutral-300 hover:bg-white/5"
-                      }`}
-                      onClick={() => onSelectedBaseChange(base.id)}
-                    >
-                      <span className="flex min-w-0 items-center gap-2">
-                        <Home
-                          className={`size-3.5 shrink-0 ${
-                            base.available === false ? "text-amber-300" : "text-emerald-300"
-                          }`}
-                        />
-                        <span className="truncate">{base.label}</span>
-                      </span>
-                      <span
-                        className={`font-mono text-[10px] ${
-                          base.available === false ? "text-amber-300" : "text-neutral-500"
-                        }`}
+                  <div
+                    key={area.id}
+                    className={`border p-2 transition ${
+                      selected
+                        ? "border-sky-300/45 bg-sky-400/15 text-sky-100"
+                        : "border-white/10 bg-black text-neutral-300"
+                    }`}
+                  >
+                    <div className="grid grid-cols-[1fr_auto] gap-2">
+                      <input
+                        className="min-w-0 border border-transparent bg-transparent px-1 py-0.5 font-semibold text-current outline-none transition focus:border-sky-300/40 focus:bg-black/60"
+                        value={area.label}
+                        onFocus={() => onSelectedAreaChange(area.id)}
+                        onChange={(event) => onRenameArea(area.id, event.target.value)}
+                        aria-label={`Rename ${area.label}`}
+                      />
+                      <button
+                        className="border border-white/10 bg-neutral-950 px-2 py-1 text-[10px] uppercase tracking-wide text-neutral-300 hover:bg-neutral-900"
+                        onClick={(event) => openActionMenu("area", area.id, event)}
                       >
-                        {base.available === false ? "offline" : (base.waypointMode ?? "nearest_safe")}
-                      </span>
-                    </button>
-                    <div className="ml-3 border-l border-white/10 pl-2">
-                      <div className="px-2 py-1 text-[10px] uppercase tracking-wide text-sky-300/80">
-                        Outbound
+                        Actions
+                      </button>
+                    </div>
+                    <div className="mt-1 grid gap-1 text-[11px] text-neutral-400">
+                      <div>
+                        Primary:{" "}
+                        <span className={primaryBase ? "text-emerald-300" : "text-neutral-600"}>
+                          {primaryBase
+                            ? `${primaryBase.label}${primaryBase.available === false ? " offline" : ""}`
+                            : "None"}
+                        </span>
                       </div>
-                      {base.outboundWaypoints.length === 0 ? (
-                        <div className="px-2 py-1 text-neutral-600">No out waypoints</div>
-                      ) : (
-                        base.outboundWaypoints.map((waypoint) => (
-                          <div
-                            key={waypoint.id}
-                            className="flex items-center justify-between gap-2 px-2 py-1 text-neutral-300"
-                          >
-                            <button
-                              className="min-w-0 truncate text-left hover:text-sky-100"
-                              onClick={() => onSelectedBaseChange(base.id)}
-                            >
-                              {waypoint.label}
-                            </button>
-                            <button
-                              className="shrink-0 text-neutral-500 transition hover:text-red-200"
-                              onClick={() => onDeleteBaseWaypoint(waypoint.id)}
-                              aria-label={`Delete ${waypoint.label}`}
-                            >
-                              <X className="size-3" />
-                            </button>
-                          </div>
-                        ))
-                      )}
-                      <div className="px-2 py-1 text-[10px] uppercase tracking-wide text-emerald-300/80">
-                        Inbound
+                      <div>
+                        Backup:{" "}
+                        <span className={backup ? "text-amber-300" : "text-neutral-600"}>
+                          {backup
+                            ? `${backup.label}${backup.available === false ? " offline" : ""}`
+                            : "None"}
+                        </span>
                       </div>
-                      {base.inboundWaypoints.length === 0 ? (
-                        <div className="px-2 py-1 text-neutral-600">No in waypoints</div>
-                      ) : (
-                        base.inboundWaypoints.map((waypoint) => (
-                          <div
-                            key={waypoint.id}
-                            className="flex items-center justify-between gap-2 px-2 py-1 text-neutral-300"
-                          >
-                            <button
-                              className="min-w-0 truncate text-left hover:text-emerald-100"
-                              onClick={() => onSelectedBaseChange(base.id)}
-                            >
-                              {waypoint.label}
-                            </button>
-                            <button
-                              className="shrink-0 text-neutral-500 transition hover:text-red-200"
-                              onClick={() => onDeleteBaseWaypoint(waypoint.id)}
-                              aria-label={`Delete ${waypoint.label}`}
-                            >
-                              <X className="size-3" />
-                            </button>
-                          </div>
-                        ))
-                      )}
+                      <div className="font-mono text-[10px] uppercase text-neutral-500">
+                        {area.polygon.length} polygon points
+                      </div>
                     </div>
                   </div>
                 );
@@ -468,32 +410,132 @@ export function MissionControls({
             )}
           </div>
 
-          <div className="mt-2 border-t border-white/10 pt-1">
-            <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">
-              No-fly zones
+          <div className="space-y-1.5 border-t border-white/10 pt-3">
+            <div className="flex items-center justify-between px-1 text-[10px] font-semibold uppercase tracking-wide text-emerald-300/80">
+              <span>Home bases</span>
+              <span className="font-mono text-neutral-500">{homeBases.length}</span>
+            </div>
+            {homeBases.length === 0 ? (
+              <div className="border border-white/10 bg-black px-2 py-2 text-neutral-600">
+                No home bases yet.
+              </div>
+            ) : (
+              homeBases.map((base) => {
+                const primaryFor = areas.filter((area) => area.linkedBaseId === base.id);
+                const backupFor = areas.filter((area) => area.backupBaseId === base.id);
+                const selected = selectedBaseId === base.id;
+                return (
+                  <div
+                    key={base.id}
+                    className={`border p-2 transition ${
+                      selected
+                        ? "border-emerald-300/45 bg-emerald-400/15 text-emerald-100"
+                        : "border-white/10 bg-black text-neutral-300"
+                    }`}
+                  >
+                    <div className="grid grid-cols-[1fr_auto] gap-2">
+                      <input
+                        className="min-w-0 border border-transparent bg-transparent px-1 py-0.5 font-semibold text-current outline-none transition focus:border-emerald-300/40 focus:bg-black/60"
+                        value={base.label}
+                        onFocus={() => onSelectedBaseChange(base.id)}
+                        onChange={(event) => onRenameBase(base.id, event.target.value)}
+                        aria-label={`Rename ${base.label}`}
+                      />
+                      <button
+                        className="border border-white/10 bg-neutral-950 px-2 py-1 text-[10px] uppercase tracking-wide text-neutral-300 hover:bg-neutral-900"
+                        onClick={(event) => openActionMenu("base", base.id, event)}
+                      >
+                        Actions
+                      </button>
+                    </div>
+                    <div className="mt-1 grid gap-1 text-[11px] text-neutral-400">
+                      <div>
+                        Supports:{" "}
+                        <span className={primaryFor.length ? "text-emerald-300" : "text-neutral-600"}>
+                          {primaryFor.map((area) => area.label).join(", ") || "No primary zones"}
+                        </span>
+                      </div>
+                      <div>
+                        Backup for:{" "}
+                        <span className={backupFor.length ? "text-amber-300" : "text-neutral-600"}>
+                          {backupFor.map((area) => area.label).join(", ") || "No backup zones"}
+                        </span>
+                      </div>
+                      <div className="font-mono text-[10px] uppercase text-neutral-500">
+                        {base.available === false ? "offline" : "available"} / {base.waypointMode}
+                      </div>
+                      {base.outboundWaypoints.length || base.inboundWaypoints.length ? (
+                        <div className="mt-1 grid gap-1 border-l border-white/10 pl-2">
+                          {[...base.outboundWaypoints, ...base.inboundWaypoints].map((waypoint) => (
+                            <div key={waypoint.id} className="flex items-center justify-between gap-2">
+                              <span className="min-w-0 truncate text-neutral-400">
+                                {waypoint.label}
+                              </span>
+                              <button
+                                className="shrink-0 text-[10px] uppercase tracking-wide text-red-200 hover:text-red-100"
+                                onClick={() => onDeleteBaseWaypoint(waypoint.id)}
+                              >
+                                Delete
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          <div className="space-y-1.5 border-t border-white/10 pt-3">
+            <div className="flex items-center justify-between px-1 text-[10px] font-semibold uppercase tracking-wide text-red-300/80">
+              <span>No-fly zones</span>
+              <span className="font-mono text-neutral-500">{planningNfzs.length}</span>
             </div>
             {planningNfzs.length === 0 ? (
-              <div className="px-2 py-1.5 text-neutral-600">No NFZ polygons</div>
+              <div className="border border-white/10 bg-black px-2 py-2 text-neutral-600">
+                No NFZ polygons yet.
+              </div>
             ) : (
-              planningNfzs.map((nfz) => (
-                <button
-                  key={nfz.id}
-                  className={`flex w-full items-center justify-between gap-2 px-2 py-1.5 text-left transition ${
-                    selectedNfzId === nfz.id
-                      ? "bg-red-500/15 text-red-100"
-                      : "text-neutral-300 hover:bg-white/5"
-                  }`}
-                  onClick={() => onSelectedNfzChange(nfz.id)}
-                >
-                  <span className="flex min-w-0 items-center gap-2">
-                    <ShieldAlert className="size-3.5 shrink-0 text-red-300" />
-                    <span className="truncate">{nfz.label}</span>
-                  </span>
-                  <span className="font-mono text-[10px] text-neutral-500">
-                    {nfz.polygon.length} pts
-                  </span>
-                </button>
-              ))
+              planningNfzs.map((nfz) => {
+                const selected = selectedNfzId === nfz.id;
+                const enabled = nfz.enabled !== false;
+                return (
+                  <div
+                    key={nfz.id}
+                    className={`border p-2 transition ${
+                      selected
+                        ? "border-red-300/45 bg-red-500/15 text-red-100"
+                        : "border-white/10 bg-black text-neutral-300"
+                    }`}
+                  >
+                    <div className="grid grid-cols-[1fr_auto] gap-2">
+                      <input
+                        className="min-w-0 border border-transparent bg-transparent px-1 py-0.5 font-semibold text-current outline-none transition focus:border-red-300/40 focus:bg-black/60"
+                        value={nfz.label}
+                        onFocus={() => onSelectedNfzChange(nfz.id)}
+                        onChange={(event) => onRenameNfz(nfz.id, event.target.value)}
+                        aria-label={`Rename ${nfz.label}`}
+                      />
+                      <button
+                        className="border border-white/10 bg-neutral-950 px-2 py-1 text-[10px] uppercase tracking-wide text-neutral-300 hover:bg-neutral-900"
+                        onClick={(event) => openActionMenu("nfz", nfz.id, event)}
+                      >
+                        Actions
+                      </button>
+                    </div>
+                    <div className="mt-1 flex flex-wrap items-center gap-2 font-mono text-[10px] uppercase">
+                      <span className={enabled ? "text-red-300" : "text-neutral-600"}>
+                        {enabled ? "active" : "disabled"}
+                      </span>
+                      <span className="text-neutral-500">
+                        {nfz.polygon.length} restricted polygon points
+                      </span>
+                    </div>
+                  </div>
+                );
+              })
             )}
           </div>
         </div>
@@ -606,7 +648,7 @@ export function MissionControls({
             ? `${selectedArea.label} is linked to ${linkedBase.label}.`
             : selectedArea && selectedBase
               ? `Ready: ${selectedBase.label} -> ${selectedArea.label}.`
-              : "Pick one blue fly-area file and one green base file, then link them. Select another base to set it as backup."}
+              : "Pick one blue zone and one green base on the map, then link them. Select another base to set it as backup."}
         </div>
         {displayedBase ? (
           <div className="mt-3 border border-white/10 bg-black p-2">
@@ -677,40 +719,6 @@ export function MissionControls({
             </div>
           </div>
         ) : null}
-      </div>
-
-      <div className="border border-white/10 bg-neutral-950 p-3">
-        <div className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-neutral-200">
-          <Crosshair className="size-4 text-neutral-400" />
-          Map Start
-        </div>
-        <select
-          className="mb-2 w-full border border-white/10 bg-black px-2 py-2 text-sm text-neutral-100 outline-none focus:border-white/30"
-          value={config.mapPresetId}
-          onChange={(event) =>
-            onConfigChange({
-              ...config,
-              mapPresetId: event.target.value as MissionConfig["mapPresetId"],
-            })
-          }
-        >
-          {MAP_PRESETS.map((preset) => (
-            <option key={preset.id} value={preset.id}>
-              {preset.label}
-            </option>
-          ))}
-        </select>
-        <select
-          className="w-full border border-white/10 bg-black px-2 py-2 text-sm text-neutral-100 outline-none focus:border-white/30"
-          value={demoMode}
-          onChange={(event) => onDemoModeChange(event.target.value as DemoMode)}
-        >
-          {DEMO_MODES.map((mode) => (
-            <option key={mode.id} value={mode.id}>
-              {mode.label}
-            </option>
-          ))}
-        </select>
       </div>
 
       <div className="border border-white/10 bg-neutral-950 p-3">
@@ -958,6 +966,55 @@ export function MissionControls({
           </button>
         </div>
       </div>
+      {actionMenu ? (
+        <>
+          <button
+            className="fixed inset-0 z-40 cursor-default"
+            aria-label="Close actions menu"
+            onClick={closeActionMenu}
+          />
+          <div
+            className="fixed z-50 grid w-34 gap-1 border border-white/10 bg-black p-1 text-xs shadow-2xl"
+            style={{ left: actionMenu.x, top: actionMenu.y, width: 136 }}
+          >
+            <button
+              className="px-2 py-1.5 text-left text-neutral-200 hover:bg-white/10"
+              onClick={() => {
+                if (actionMenu.kind === "area") onSelectedAreaChange(actionMenu.id);
+                if (actionMenu.kind === "base") onSelectedBaseChange(actionMenu.id);
+                if (actionMenu.kind === "nfz") onSelectedNfzChange(actionMenu.id);
+                closeActionMenu();
+              }}
+            >
+              Select
+            </button>
+            {actionMenu.kind === "nfz" ? (
+              <button
+                className="px-2 py-1.5 text-left text-neutral-200 hover:bg-white/10"
+                onClick={() => {
+                  onToggleNfzEnabled(actionMenu.id);
+                  closeActionMenu();
+                }}
+              >
+                {planningNfzs.find((nfz) => nfz.id === actionMenu.id)?.enabled === false
+                  ? "Enable"
+                  : "Disable"}
+              </button>
+            ) : null}
+            <button
+              className="px-2 py-1.5 text-left text-red-200 hover:bg-red-500/15"
+              onClick={() => {
+                if (actionMenu.kind === "area") onDeleteArea(actionMenu.id);
+                if (actionMenu.kind === "base") onDeleteBase(actionMenu.id);
+                if (actionMenu.kind === "nfz") onDeleteNfz(actionMenu.id);
+                closeActionMenu();
+              }}
+            >
+              Delete
+            </button>
+          </div>
+        </>
+      ) : null}
     </aside>
   );
 }
