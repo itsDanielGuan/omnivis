@@ -12,7 +12,7 @@ import {
 } from "@/lib/geometry";
 import { computeMissionMetrics } from "@/lib/metrics";
 import { UAV_COLORS } from "@/lib/presets";
-import { buildRouteFromStart } from "@/lib/planner";
+import { buildRouteFromStart, generateMissionPlanFromArea } from "@/lib/planner";
 import {
   buildReturnRouteViaBaseWaypoint,
   normalizeHomeBase,
@@ -51,6 +51,17 @@ function isFullSignal(plan: MissionPlan): boolean {
 }
 
 const COMMUNICATION_LOSS_PERIOD_S = 90;
+
+function rebuildPreflightNfzPlan(sourcePlan: MissionPlan, nfzs: Nfz[]): MissionPlan {
+  const plan = generateMissionPlanFromArea(
+    sourcePlan.config,
+    sourcePlan.aoo,
+    sourcePlan.homeBase,
+    nfzs,
+  );
+  plan.lossResponseMode = sourcePlan.lossResponseMode;
+  return plan;
+}
 
 function addEvent(
   plan: MissionPlan,
@@ -672,6 +683,10 @@ export function applyNfz(
   };
   plan.nfzs.push(nfz);
 
+  if (timeS <= 0) {
+    return rebuildPreflightNfzPlan(sourcePlan, plan.nfzs);
+  }
+
   const blocked = remarkNfzBlockedStrips(plan);
 
   plan.uavs
@@ -737,6 +752,11 @@ export function applyNfzSetUpdate(
 
   const timeS = Math.max(0, requestedTimeS);
   plan.nfzs = nfzs.map((nfz) => ({ ...nfz, createdAtS: timeS }));
+
+  if (timeS <= 0) {
+    return rebuildPreflightNfzPlan(sourcePlan, plan.nfzs);
+  }
+
   const source =
     plan.uavs.find((uav) => uav.id === sourceUavId && uav.status !== "lost") ??
     plan.uavs.find((uav) => uav.status !== "lost");

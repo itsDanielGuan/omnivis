@@ -911,6 +911,8 @@ const THEATER_JUMPS = [
   },
 ] as const;
 
+const DEFAULT_THEATER_JUMP = THEATER_JUMPS[0];
+
 export function MapMissionView({
   plan,
   mapPreset,
@@ -964,8 +966,8 @@ export function MapMissionView({
     committed?: boolean;
   } | null>(null);
   const initialViewRef = useRef({
-    center: mapPreset.mapCenter,
-    zoom: mapPreset.mapZoom,
+    center: DEFAULT_THEATER_JUMP.center,
+    zoom: DEFAULT_THEATER_JUMP.zoom,
   });
   const [loaded, setLoaded] = useState(false);
 
