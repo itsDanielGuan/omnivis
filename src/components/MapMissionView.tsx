@@ -804,6 +804,55 @@ function addMissionLayers(map: MapLibreMap) {
       },
     },
     {
+      id: "mission-threat-ring-fill",
+      type: "fill",
+      filter: ["==", ["get", "kind"], "threat_ring"],
+      paint: {
+        "fill-color": ["get", "color"],
+        "fill-opacity": 0.1,
+      },
+    },
+    {
+      id: "mission-threat-ring-line",
+      type: "line",
+      filter: ["==", ["get", "kind"], "threat_ring"],
+      paint: {
+        "line-color": ["get", "color"],
+        "line-width": 1.4,
+        "line-opacity": 0.8,
+        "line-dasharray": [2, 2],
+      },
+    },
+    {
+      id: "mission-threat-fill",
+      type: "circle",
+      filter: ["==", ["get", "kind"], "threat"],
+      paint: {
+        "circle-radius": 7,
+        "circle-color": ["get", "color"],
+        "circle-opacity": 0.9,
+        "circle-stroke-color": "#0a0a0a",
+        "circle-stroke-width": 1.5,
+      },
+    },
+    {
+      id: "mission-threat-label",
+      type: "symbol",
+      filter: ["==", ["get", "kind"], "threat"],
+      layout: {
+        "text-field": ["get", "label"],
+        "text-size": 10,
+        "text-offset": [0, 1.4],
+        "text-anchor": "top",
+        "text-allow-overlap": true,
+      },
+      paint: {
+        "text-color": ["get", "color"],
+        "text-halo-color": "#000000",
+        "text-halo-width": 1.4,
+      },
+    },
+    {
       id: "mission-base-halo",
       type: "circle",
       filter: ["==", ["get", "kind"], "base"],
@@ -1318,7 +1367,8 @@ export function MapMissionView({
         editorMode === "draw_nfz" ||
         editorMode === "place_base" ||
         editorMode === "place_outbound_waypoint" ||
-        editorMode === "place_inbound_waypoint"
+        editorMode === "place_inbound_waypoint" ||
+        editorMode === "place_threat"
       ) {
         callbacksRef.current.onMapPoint(localPoint(event));
         return;

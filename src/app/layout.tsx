@@ -2,9 +2,12 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "OmniVis Mission Compiler",
+  title: "Omnivision",
   description:
     "Radio-minimal cooperative maritime coverage planner and simulator for fixed-wing UAV teams.",
+  icons: {
+    icon: "/omnivisionfavicon.png",
+  },
 };
 
 export default function RootLayout({

@@ -815,6 +815,7 @@ function buildMissionPlan(
     strips: assignedStrips,
     uavs,
     nfzs,
+    threats: [],
     messages: makeMessages(uavIds),
     events: makeInitialEvents(config.uavCount),
     lossResponseMode: "dispatch_replacement",

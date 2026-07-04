@@ -45,7 +45,8 @@ export type EditorMode =
   | "draw_nfz"
   | "place_base"
   | "place_outbound_waypoint"
-  | "place_inbound_waypoint";
+  | "place_inbound_waypoint"
+  | "place_threat";
 
 export type RoutePhase =
   | "preflight"
@@ -59,7 +60,20 @@ export type RoutePhase =
   | "reserve"
   | "replacement"
   | "regained"
-  | "recharge";
+  | "recharge"
+  | "strike";
+
+export type ThreatKind = "merchant" | "small" | "large";
+
+export type StrikeType = "continuous" | "saturation";
+
+export type ThreatPhase =
+  | "confirming"
+  | "awaiting_decision"
+  | "loiter_hold"
+  | "striking"
+  | "friendly"
+  | "destroyed";
 
 export type UavStatus =
   | "ready"
@@ -119,6 +133,7 @@ export type PlanningArea = {
   polygon: Point[];
   linkedBaseId?: string;
   backupBaseId?: string;
+  strikeBaseId?: string;
 };
 
 export type BaseWaypointMode = "nearest_safe" | "round_robin" | "specific";
@@ -190,6 +205,29 @@ export type UavPlan = {
   lostAtS?: number;
   lossPoint?: Point;
   regainedAtS?: number;
+  threatRole?: "confirm" | "strike";
+  threatId?: string;
+  combat?: boolean;
+};
+
+export type Threat = {
+  id: string;
+  kind: ThreatKind;
+  point: Point;
+  createdAtS: number;
+  detectedByUavId?: string;
+  detectedAtS?: number;
+  confirmUavId?: string;
+  confirmArrivalS?: number;
+  phase: ThreatPhase;
+  resolvedAtS?: number;
+  strike?: {
+    type: StrikeType;
+    droneCount: number;
+    baseId?: string;
+    launchS: number;
+    impactS: number;
+  };
 };
 
 export type Nfz = {
@@ -266,6 +304,8 @@ export type MissionPlan = {
   strips: CoverageStrip[];
   uavs: UavPlan[];
   nfzs: Nfz[];
+  threats: Threat[];
+  strikeBase?: HomeBase;
   messages: MissionMessage[];
   events: MissionEvent[];
   metrics: MissionMetrics;

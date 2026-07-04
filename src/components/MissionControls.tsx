@@ -16,7 +16,6 @@ import {
   ScanLine,
   ShieldAlert,
   Shuffle,
-  Siren,
   Sparkles,
   Trash2,
   X,
@@ -32,6 +31,7 @@ import type {
   MissionConfig,
   PlanningArea,
   PlanningNfz,
+  ThreatKind,
 } from "@/lib/types";
 
 type ActionMenu =
@@ -75,6 +75,10 @@ type Props = {
   onLinkBaseToArea: () => void;
   onLinkBackupBaseToArea: () => void;
   onClearBackupBaseFromArea: () => void;
+  onLinkStrikeBaseToArea: () => void;
+  onClearStrikeBaseFromArea: () => void;
+  threatKind: ThreatKind;
+  onPlaceThreat: (kind: ThreatKind) => void;
   onRenameArea: (areaId: string, label: string) => void;
   onRenameBase: (baseId: string, label: string) => void;
   onRenameNfz: (nfzId: string, label: string) => void;
@@ -316,6 +320,10 @@ export function MissionControls({
   onLinkBaseToArea,
   onLinkBackupBaseToArea,
   onClearBackupBaseFromArea,
+  onLinkStrikeBaseToArea,
+  onClearStrikeBaseFromArea,
+  threatKind,
+  onPlaceThreat,
   onRenameArea,
   onRenameBase,
   onRenameNfz,
@@ -340,6 +348,9 @@ export function MissionControls({
     : undefined;
   const backupBase = selectedArea?.backupBaseId
     ? homeBases.find((base) => base.id === selectedArea.backupBaseId)
+    : undefined;
+  const strikeBase = selectedArea?.strikeBaseId
+    ? homeBases.find((base) => base.id === selectedArea.strikeBaseId)
     : undefined;
   const displayedBase = selectedBase ?? linkedBase ?? backupBase;
   const linkedBaseOffline = linkedBase?.available === false;
@@ -487,14 +498,6 @@ export function MissionControls({
             Delete
           </button>
           <button
-            className="inline-flex items-center justify-center gap-2 border border-white/10 bg-neutral-900 px-3 py-2 text-sm font-semibold text-neutral-100 transition hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-35"
-            disabled={!canTriggerSelectedLoss}
-            onClick={onSimulateLoss}
-          >
-            <Siren className="size-4" />
-            UAV Loss
-          </button>
-          <button
             className="inline-flex items-center justify-center gap-2 border border-emerald-300/30 bg-emerald-400/10 px-3 py-2 text-sm font-semibold text-emerald-100 transition hover:bg-emerald-400/18 disabled:cursor-not-allowed disabled:opacity-35"
             disabled={!selectedAreaId || !selectedBaseId}
             onClick={onLinkBaseToArea}
@@ -528,6 +531,43 @@ export function MissionControls({
               ? " Click the map once to place the selected base waypoint."
               : " Areas remain available after every compile/reset."}
           </div>
+        </div>
+      </div>
+
+      <div className="border border-white/10 bg-neutral-950 p-3">
+        <div className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-neutral-200">
+          <Crosshair className="size-4 text-rose-300" />
+          Threats
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          {(
+            [
+              { id: "merchant", label: "Merchant", hint: "friendly" },
+              { id: "small", label: "Small", hint: "medium" },
+              { id: "large", label: "Large", hint: "saturation" },
+            ] as { id: ThreatKind; label: string; hint: string }[]
+          ).map((option) => {
+            const active = editorMode === "place_threat" && threatKind === option.id;
+            return (
+              <button
+                key={option.id}
+                className={`flex flex-col items-center gap-0.5 border px-2 py-2 text-xs font-semibold transition ${
+                  active
+                    ? "border-rose-400/60 bg-rose-500/20 text-rose-100"
+                    : "border-white/10 bg-black text-neutral-300 hover:bg-white/5"
+                }`}
+                onClick={() => onPlaceThreat(option.id)}
+              >
+                <span>{option.label}</span>
+                <span className="text-[9px] font-normal text-neutral-500">{option.hint}</span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="mt-2 border border-white/10 bg-black p-2 text-xs text-neutral-400">
+          {editorMode === "place_threat"
+            ? "Click the map to drop the selected threat onto a searching drone's path."
+            : "Compile and run a mission, pick a threat type, then click the map to drop it."}
         </div>
       </div>
 
@@ -849,6 +889,31 @@ export function MissionControls({
               {backupBaseOffline ? " offline" : ""}
             </span>
           </div>
+        </div>
+        <div className="mt-2 grid grid-cols-2 gap-2">
+          <button
+            className="inline-flex items-center justify-center gap-2 border border-rose-300/40 bg-rose-400/10 px-2 py-2 text-xs font-semibold text-rose-100 transition hover:bg-rose-400/18 disabled:cursor-not-allowed disabled:opacity-35"
+            disabled={!selectedAreaId || !selectedBaseId}
+            onClick={onLinkStrikeBaseToArea}
+          >
+            <Crosshair className="size-3.5" />
+            Set Strike Base
+          </button>
+          <button
+            className="inline-flex items-center justify-center gap-2 border border-white/10 bg-black px-2 py-2 text-xs font-semibold text-neutral-300 transition hover:border-white/25 hover:bg-neutral-900 disabled:cursor-not-allowed disabled:opacity-35"
+            disabled={!selectedArea?.strikeBaseId}
+            onClick={onClearStrikeBaseFromArea}
+          >
+            <X className="size-3.5" />
+            Clear Strike Base
+          </button>
+        </div>
+        <div className="mt-2 border border-rose-300/20 bg-rose-500/5 p-2 text-[11px] text-rose-100/80">
+          Strike base for this area:{" "}
+          <span className="font-semibold text-rose-100">
+            {strikeBase?.label ?? "Primary base (default)"}
+          </span>
+          . Strike packages launch from here.
         </div>
         <div className="mt-2 border border-white/10 bg-black p-2 text-xs text-neutral-400">
           {selectedArea && linkedBaseOffline && backupBase && !backupBaseOffline

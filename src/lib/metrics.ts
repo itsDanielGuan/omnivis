@@ -43,7 +43,7 @@ function estimateCoverage(plan: MissionPlan): number {
 }
 
 function estimateMinSeparation(plan: MissionPlan): number {
-  const activeUavs = plan.uavs.filter((uav) => uav.status !== "lost");
+  const activeUavs = plan.uavs.filter((uav) => uav.status !== "lost" && !uav.combat);
   if (activeUavs.length < 2) return 0;
   const maxTime = Math.max(
     ...activeUavs.map((uav) => uav.route[uav.route.length - 1]?.t ?? 0),
@@ -76,7 +76,7 @@ function estimateMinSeparation(plan: MissionPlan): number {
 }
 
 export function computeMissionMetrics(plan: MissionPlan): MissionMetrics {
-  const activeUavs = plan.uavs.filter((uav) => uav.status !== "lost");
+  const activeUavs = plan.uavs.filter((uav) => uav.status !== "lost" && !uav.combat);
   const missionCompletionTimeS = Math.max(
     1,
     ...activeUavs.map((uav) => uav.route[uav.route.length - 1]?.t ?? 0),

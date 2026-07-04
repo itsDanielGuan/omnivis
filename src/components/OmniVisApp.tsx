@@ -6,8 +6,8 @@ import { Header } from "@/components/Header";
 import { MapMissionView } from "@/components/MapMissionView";
 import { MetricsPanel } from "@/components/MetricsPanel";
 import { MissionControls } from "@/components/MissionControls";
-import { MissionPlannerVideo } from "@/components/MissionPlannerVideo";
 import { TacticalEventFeed } from "@/components/TacticalEventFeed";
+import { ThreatDecisionPanel } from "@/components/ThreatDecisionPanel";
 import { TimelineControls } from "@/components/TimelineControls";
 import { UnitCard } from "@/components/UnitCard";
 import { downloadMissionPackage } from "@/lib/exporters";
@@ -28,6 +28,13 @@ import {
   armRtbDemo,
   sendHealthPing,
 } from "@/lib/simulator";
+import {
+  applyThreat,
+  applyThreatDecision,
+  defaultLoiterForArrivedThreats,
+  nextThreatDecisionTimeS,
+  pendingThreatAt,
+} from "@/lib/threats";
 import type {
   BaseWaypointMode,
   DemoMode,
@@ -39,6 +46,8 @@ import type {
   PlanningArea,
   PlanningNfz,
   Point,
+  StrikeType,
+  ThreatKind,
   UavPlan,
 } from "@/lib/types";
 
@@ -85,12 +94,15 @@ function normalizePlanningArea(area: Partial<PlanningArea>): PlanningArea {
     typeof area.backupBaseId === "string" && area.backupBaseId !== linkedBaseId
       ? area.backupBaseId
       : undefined;
+  const strikeBaseId =
+    typeof area.strikeBaseId === "string" ? area.strikeBaseId : undefined;
   return {
     id: typeof area.id === "string" ? area.id : makeId("area"),
     label: typeof area.label === "string" ? area.label : "Fly Zone",
     polygon: Array.isArray(area.polygon) ? area.polygon : [],
     linkedBaseId,
     backupBaseId,
+    strikeBaseId,
   };
 }
 
@@ -203,6 +215,7 @@ export function OmniVisApp() {
   const [simTimeS, setSimTimeS] = useState(0);
   const [isRunning, setIsRunning] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(30);
+  const [threatKind, setThreatKind] = useState<ThreatKind>("small");
   const mapPreset = useMemo(() => getMapPreset(config.mapPresetId), [config.mapPresetId]);
   const maxTimeS = useMemo(() => getMissionMaxTime(plan), [plan]);
   const planningNfzsRef = useRef(planningNfzs);
@@ -229,15 +242,17 @@ export function OmniVisApp() {
       const elapsed = ((now - last) / 1000) * playbackRate;
       last = now;
       setSimTimeS((current) => {
-        const next = Math.min(maxTimeS, current + elapsed);
-        if (next >= maxTimeS) setIsRunning(false);
+        const decisionStopS = nextThreatDecisionTimeS(plan, current);
+        const cap = decisionStopS !== undefined ? Math.min(maxTimeS, decisionStopS) : maxTimeS;
+        const next = Math.min(cap, current + elapsed);
+        if (next >= cap) setIsRunning(false);
         return next;
       });
       frame = requestAnimationFrame(tick);
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
-  }, [isRunning, maxTimeS, playbackRate]);
+  }, [isRunning, maxTimeS, playbackRate, plan]);
 
   const selectedArea = areas.find((area) => area.id === selectedAreaId);
   const linkedBase = selectedArea?.linkedBaseId
@@ -253,6 +268,8 @@ export function OmniVisApp() {
   const canCompile = Boolean(selectedArea && compileBase);
   const selectedUav = plan?.uavs.find((uav) => uav.id === selectedUavId);
   const canTriggerSelectedLoss = canArmCommunicationLoss(selectedUav);
+  const pendingThreat = pendingThreatAt(plan, simTimeS);
+  const strikeBaseLabel = plan?.strikeBase?.label ?? plan?.homeBase.label ?? "Primary base";
 
   const compileMission = useCallback(() => {
     const area = selectedArea ?? areas[0];
@@ -271,6 +288,10 @@ export function OmniVisApp() {
         planningNfzToMissionNfz(nfz.label || `NFZ_${index + 1}`, nfz.polygon, simTimeS),
       );
     const nextPlan = generateMissionPlanFromArea(config, area.polygon, base, nfzs);
+    const strikeBase = area.strikeBaseId
+      ? homeBases.find((candidate) => candidate.id === area.strikeBaseId)
+      : undefined;
+    nextPlan.strikeBase = strikeBase ? normalizeHomeBase(strikeBase) : undefined;
     if (
       primaryBase &&
       normalizeHomeBase(primaryBase).available === false &&
@@ -341,6 +362,13 @@ export function OmniVisApp() {
   };
 
   const handleMapPoint = (point: Point) => {
+    if (editorMode === "place_threat") {
+      if (plan) {
+        setPlan(applyThreat(plan, threatKind, point, simTimeS));
+      }
+      setEditorMode("select");
+      return;
+    }
     if (editorMode === "place_base") {
       const nextBase: HomeBase = {
         id: makeId("base"),
@@ -444,11 +472,14 @@ export function OmniVisApp() {
     setHomeBases((current) => current.filter((base) => base.id !== baseId));
     setAreas((current) =>
       current.map((area) =>
-        area.linkedBaseId === baseId || area.backupBaseId === baseId
+        area.linkedBaseId === baseId ||
+        area.backupBaseId === baseId ||
+        area.strikeBaseId === baseId
           ? {
               ...area,
               linkedBaseId: area.linkedBaseId === baseId ? undefined : area.linkedBaseId,
               backupBaseId: area.backupBaseId === baseId ? undefined : area.backupBaseId,
+              strikeBaseId: area.strikeBaseId === baseId ? undefined : area.strikeBaseId,
             }
           : area,
       ),
@@ -487,6 +518,26 @@ export function OmniVisApp() {
         if (area.id !== selectedAreaId || area.linkedBaseId === selectedBaseId) return area;
         return { ...area, backupBaseId: selectedBaseId };
       }),
+    );
+    setPlan(null);
+  };
+
+  const linkStrikeBaseToArea = () => {
+    if (!selectedAreaId || !selectedBaseId) return;
+    setAreas((current) =>
+      current.map((area) =>
+        area.id === selectedAreaId ? { ...area, strikeBaseId: selectedBaseId } : area,
+      ),
+    );
+    setPlan(null);
+  };
+
+  const clearStrikeBaseFromArea = () => {
+    if (!selectedAreaId) return;
+    setAreas((current) =>
+      current.map((area) =>
+        area.id === selectedAreaId ? { ...area, strikeBaseId: undefined } : area,
+      ),
     );
     setPlan(null);
   };
@@ -747,6 +798,36 @@ export function OmniVisApp() {
     setPlan(applyVehicleLoss(plan, failedId, lossResponseMode, simTimeS));
   };
 
+  const handleRunningChange = (running: boolean) => {
+    if (running && plan) {
+      const resolved = defaultLoiterForArrivedThreats(plan, simTimeS);
+      if (resolved !== plan) setPlan(resolved);
+    }
+    setIsRunning(running);
+  };
+
+  const handleThreatLoiter = () => {
+    if (!plan || !pendingThreat) return;
+    setPlan(applyThreatDecision(plan, pendingThreat.id, { action: "loiter" }));
+  };
+
+  const handleThreatStrike = (strikeType: StrikeType, droneCount: number) => {
+    if (!plan || !pendingThreat) return;
+    setPlan(
+      applyThreatDecision(plan, pendingThreat.id, {
+        action: "strike",
+        strikeType,
+        droneCount,
+      }),
+    );
+  };
+
+  const handlePlaceThreat = (kind: ThreatKind) => {
+    setThreatKind(kind);
+    setEditorMode("place_threat");
+    setDraftPolygon([]);
+  };
+
   const triggerNfzDemo = () => {
     if (!plan) return;
     const nfz = planningNfzs.find((candidate) => candidate.id === selectedNfzId);
@@ -823,6 +904,10 @@ export function OmniVisApp() {
           onLinkBaseToArea={linkBaseToArea}
           onLinkBackupBaseToArea={linkBackupBaseToArea}
           onClearBackupBaseFromArea={clearBackupBaseFromArea}
+          onLinkStrikeBaseToArea={linkStrikeBaseToArea}
+          onClearStrikeBaseFromArea={clearStrikeBaseFromArea}
+          threatKind={threatKind}
+          onPlaceThreat={handlePlaceThreat}
           onRenameArea={renameArea}
           onRenameBase={renameBase}
           onRenameNfz={renameNfz}
@@ -864,6 +949,14 @@ export function OmniVisApp() {
           />
         </div>
         <aside className="flex min-h-0 flex-col gap-3 overflow-y-auto border-l border-white/10 bg-black p-3">
+          {pendingThreat ? (
+            <ThreatDecisionPanel
+              threat={pendingThreat}
+              strikeBaseLabel={strikeBaseLabel}
+              onLoiter={handleThreatLoiter}
+              onStrike={handleThreatStrike}
+            />
+          ) : null}
           <MetricsPanel
             plan={plan}
             simTimeS={simTimeS}
@@ -882,7 +975,6 @@ export function OmniVisApp() {
           />
           <TacticalEventFeed plan={plan} simTimeS={simTimeS} />
           <ExportPanel plan={plan} />
-          <MissionPlannerVideo />
         </aside>
       </div>
       <TimelineControls
@@ -891,7 +983,7 @@ export function OmniVisApp() {
         isRunning={isRunning}
         playbackRate={playbackRate}
         onTimeChange={setSimTimeS}
-        onRunningChange={setIsRunning}
+        onRunningChange={handleRunningChange}
         onPlaybackRateChange={setPlaybackRate}
         onResetTime={() => {
           setSimTimeS(0);

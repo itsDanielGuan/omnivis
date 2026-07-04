@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(grep -iE \"^tsx$|^ts-node$|esbuild\")",
+      "Bash(node -e \"console.log\\(require\\('./tsconfig.json'\\).compilerOptions.paths\\)\")",
+      "Bash(npx --yes tsx@4 \"C:/Users/danie/AppData/Local/Temp/claude/c--projects-omnivisproject-omnivis/f93ff591-f2ae-46a7-97c7-894bf8cec7c1/scratchpad/threat-smoke.ts\")"
+    ]
+  }
+}

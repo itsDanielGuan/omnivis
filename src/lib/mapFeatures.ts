@@ -202,6 +202,52 @@ export function missionToGeoJson(
     );
   });
 
+  plan.threats.forEach((threat) => {
+    const destroyed = threat.phase === "destroyed";
+    const friendly = threat.phase === "friendly";
+    const color = destroyed
+      ? "#6b7280"
+      : friendly
+        ? "#22c55e"
+        : threat.kind === "large"
+          ? "#ef4444"
+          : threat.kind === "small"
+            ? "#f97316"
+            : "#f59e0b";
+    const ringRadius = threat.kind === "large" ? 340 : threat.kind === "small" ? 230 : 160;
+    const label = friendly
+      ? "FRIENDLY"
+      : destroyed
+        ? "DESTROYED"
+        : threat.kind === "merchant"
+          ? "MERCHANT?"
+          : threat.kind === "small"
+            ? "SMALL"
+            : "LARGE";
+    features.push(
+      feature(
+        {
+          type: "Polygon",
+          coordinates: [localCircleToLngLat(plan.mapPreset, threat.point, ringRadius, 48)],
+        },
+        { kind: "threat_ring", id: `${threat.id}_ring`, color },
+      ),
+    );
+    features.push(
+      feature(
+        { type: "Point", coordinates: toLngLat(plan.mapPreset, threat.point) },
+        {
+          kind: "threat",
+          id: threat.id,
+          color,
+          threatKind: threat.kind,
+          phase: threat.phase,
+          label,
+        },
+      ),
+    );
+  });
+
   features.push(
     feature(
       {
