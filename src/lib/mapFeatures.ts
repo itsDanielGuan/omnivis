@@ -1,4 +1,5 @@
 import { closeRing, localCircleToLngLat, pointsToLngLat, toLngLat } from "@/lib/geo";
+import { detectionRadiusM } from "@/lib/geometry";
 import { getUavSnapshot } from "@/lib/simulator";
 import type { Feature, FeatureCollection, Geometry } from "geojson";
 import type { CoverageStrip, MissionMessage, MissionPlan, Point, RouteWaypoint, UavPlan } from "@/lib/types";
@@ -157,23 +158,24 @@ export function missionToGeoJson(
     );
 
     if (uav.status !== "lost") {
+      // Detection zone drawn as a native circle layer (guaranteed round in
+      // screen space). We carry the radius as screen pixels at zoom 0 so the
+      // paint expression can scale it by 2^zoom and keep it constant in meters.
+      const detectionM = detectionRadiusM(plan.config, uav.altitudeM);
+      const cosLat = Math.cos((plan.mapPreset.baseLat * Math.PI) / 180);
+      const metersPerPixelAtZoom0 = 78271.5169 * cosLat;
+      const radiusPxAtZoom0 = detectionM / metersPerPixelAtZoom0;
       features.push(
         feature(
           {
-            type: "Polygon",
-            coordinates: [
-              localCircleToLngLat(
-                plan.mapPreset,
-                current,
-                plan.config.sensorSwathM * 0.48,
-                32,
-              ),
-            ],
+            type: "Point",
+            coordinates: toLngLat(plan.mapPreset, current),
           },
           {
             kind: "sensor",
             id: `${uav.id}_sensor`,
             color: uav.colorSoft,
+            radiusPxAtZoom0,
           },
         ),
       );

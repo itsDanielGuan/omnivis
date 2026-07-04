@@ -1,7 +1,27 @@
-import type { Point, RouteWaypoint } from "@/lib/types";
+import type { MissionConfig, Point, RouteWaypoint } from "@/lib/types";
 
 export function distance(a: Point, b: Point): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+/**
+ * Radius (meters) of a drone's circular detection zone for suspicious objects.
+ *
+ * Derived from mission parameters only:
+ *  - base radius is half the sensor swath (the sensor's ground footprint reach),
+ *  - scaled by the drone's altitude layer relative to the base layer, so a higher
+ *    drone sees a proportionally wider ground footprint for the same sensor.
+ *
+ * When `altitudeM` is omitted the un-scaled base radius (swath / 2) is returned.
+ * This is the single source of truth for detection reach and is intended to feed
+ * the future suspicious-object detection logic.
+ */
+export function detectionRadiusM(config: MissionConfig, altitudeM?: number): number {
+  const baseRadiusM = config.sensorSwathM / 2;
+  if (altitudeM === undefined || config.altitudeLayerStartM <= 0) {
+    return baseRadiusM;
+  }
+  return baseRadiusM * (altitudeM / config.altitudeLayerStartM);
 }
 
 export function midpoint(a: Point, b: Point): Point {

@@ -11,7 +11,7 @@ import {
   ShieldCheck,
   TriangleAlert,
 } from "lucide-react";
-import { formatClock } from "@/lib/geometry";
+import { detectionRadiusM, formatClock } from "@/lib/geometry";
 import { getCurrentTask, getUavSnapshot } from "@/lib/simulator";
 import type { MissionPlan, UavPlan } from "@/lib/types";
 
@@ -319,6 +319,9 @@ export function MetricsPanel({ plan, simTimeS, selectedUavId, onSelectUav }: Pro
                 <span className="text-right font-mono text-xs text-neutral-300">
                   {Math.round(snapshot.progressPct)}%
                   <span className="block text-neutral-500">{uav.altitudeM}m</span>
+                  <span className="block text-cyan-300/80" title="Detection zone radius">
+                    {Math.round(detectionRadiusM(plan.config, uav.altitudeM))}m det
+                  </span>
                 </span>
               </button>
             );

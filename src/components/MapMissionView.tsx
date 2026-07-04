@@ -689,11 +689,25 @@ function addMissionLayers(map: MapLibreMap) {
     },
     {
       id: "mission-sensor-fill",
-      type: "fill",
+      type: "circle",
       filter: ["==", ["get", "kind"], "sensor"],
       paint: {
-        "fill-color": ["get", "color"],
-        "fill-opacity": 0.28,
+        // Radius stays constant in meters: pixels = radiusPxAtZoom0 * 2^zoom.
+        "circle-radius": [
+          "interpolate",
+          ["exponential", 2],
+          ["zoom"],
+          0,
+          ["get", "radiusPxAtZoom0"],
+          22,
+          ["*", ["get", "radiusPxAtZoom0"], 4194304],
+        ],
+        "circle-color": ["get", "color"],
+        "circle-opacity": 0.45,
+        "circle-stroke-color": ["get", "color"],
+        "circle-stroke-width": 1.5,
+        "circle-stroke-opacity": 0.9,
+        "circle-pitch-alignment": "map",
       },
     },
     {

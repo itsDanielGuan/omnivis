@@ -10,7 +10,7 @@ import {
   Shuffle,
   Siren,
 } from "lucide-react";
-import { formatMissionClock } from "@/lib/geometry";
+import { detectionRadiusM, formatMissionClock } from "@/lib/geometry";
 import { getCurrentTask, getUavSnapshot } from "@/lib/simulator";
 import type { LossResponseMode, MissionPlan } from "@/lib/types";
 
@@ -45,6 +45,7 @@ export function UnitCard({
   }
 
   const snapshot = getUavSnapshot(uav, simTimeS);
+  const detectionRadius = detectionRadiusM(plan.config, uav.altitudeM);
   const fullSignal = plan.config.commsPolicy === "full_signal";
   const lossDetectedAtS = uav.lossDetectedAtS ?? uav.lostAtS;
   const hasLossLifecycle =
@@ -137,6 +138,19 @@ export function UnitCard({
             {formatMissionClock(uav.rtbSlotS)}
           </span>
         </div>
+      </div>
+
+      <div className="mt-2 border border-cyan-300/25 bg-cyan-400/5 p-2 text-xs">
+        <span className="flex items-center gap-1 text-cyan-200/80">
+          <ScanSearch className="size-3.5" />
+          Detection zone radius
+        </span>
+        <span className="mt-0.5 block font-mono text-base text-cyan-100">
+          {Math.round(detectionRadius)}m
+        </span>
+        <span className="mt-0.5 block text-[10px] text-neutral-500">
+          Suspicious-object sensing range from sensor swath and altitude layer.
+        </span>
       </div>
 
       <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
