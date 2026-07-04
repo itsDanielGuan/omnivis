@@ -213,8 +213,8 @@ function detourCandidate(
 ): Point[] {
   const sides = sideSeed >= 0 ? [1, -1] : [-1, 1];
   const clearances = nfz.polygon?.length
-    ? [120, 180, 260, 380, 540, 760]
-    : [140, 220, 340, 500, 720, 980];
+    ? [45, 70, 110, 170, 260, 380]
+    : [60, 95, 150, 230, 340, 500];
   const safeCandidates: Point[][] = [];
 
   for (const clearance of clearances) {

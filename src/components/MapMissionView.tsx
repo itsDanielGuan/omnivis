@@ -49,12 +49,28 @@ type Props = {
     delta: Point,
     vertexIndex?: number,
   ) => void;
+  onCommitEditorFeatureMove: (
+    kind: EditorFeatureKind,
+    id: string,
+    delta?: Point,
+    vertexIndex?: number,
+  ) => void;
 };
 
 const EMPTY_COLLECTION = {
   type: "FeatureCollection" as const,
   features: [],
 };
+
+function shiftPolygon(polygon: Point[], delta: Point, vertexIndex?: number): Point[] {
+  return polygon.map((point, index) => {
+    if (vertexIndex !== undefined && index !== vertexIndex) return point;
+    return {
+      x: point.x + delta.x,
+      y: point.y + delta.y,
+    };
+  });
+}
 
 const EDITOR_HIT_LAYERS = [
   "editor-vertices",
@@ -912,6 +928,7 @@ export function MapMissionView({
   onMapPoint,
   onSelectEditorFeature,
   onMoveEditorFeature,
+  onCommitEditorFeatureMove,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -920,18 +937,67 @@ export function MapMissionView({
   const nfzMarkersRef = useRef<Array<{ remove: () => void }>>([]);
   const popupRef = useRef<MapLibrePopup | null>(null);
   const popupSuppressedUntilRef = useRef(0);
+  const editorDataRef = useRef({ areas, homeBases, planningNfzs });
+  const editorViewRef = useRef({
+    draftPolygon,
+    editorMode,
+    selectedAreaId,
+    selectedBaseId,
+    selectedNfzId,
+  });
+  const callbacksRef = useRef({
+    onSelectUav,
+    onMapPoint,
+    onSelectEditorFeature,
+    onMoveEditorFeature,
+    onCommitEditorFeatureMove,
+  });
   const dragRef = useRef<{
     kind: EditorFeatureKind;
     id: string;
     vertexIndex?: number;
+    startPoint: Point;
     lastPoint: Point;
+    totalDelta: Point;
+    originalPolygon?: Point[];
     moved: boolean;
+    committed?: boolean;
   } | null>(null);
   const initialViewRef = useRef({
     center: mapPreset.mapCenter,
     zoom: mapPreset.mapZoom,
   });
   const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    editorDataRef.current = { areas, homeBases, planningNfzs };
+  }, [areas, homeBases, planningNfzs]);
+
+  useEffect(() => {
+    editorViewRef.current = {
+      draftPolygon,
+      editorMode,
+      selectedAreaId,
+      selectedBaseId,
+      selectedNfzId,
+    };
+  }, [draftPolygon, editorMode, selectedAreaId, selectedBaseId, selectedNfzId]);
+
+  useEffect(() => {
+    callbacksRef.current = {
+      onSelectUav,
+      onMapPoint,
+      onSelectEditorFeature,
+      onMoveEditorFeature,
+      onCommitEditorFeatureMove,
+    };
+  }, [
+    onCommitEditorFeatureMove,
+    onMapPoint,
+    onMoveEditorFeature,
+    onSelectEditorFeature,
+    onSelectUav,
+  ]);
 
   const geoJson: FeatureCollection = useMemo(() => {
     return plan
@@ -1086,13 +1152,18 @@ export function MapMissionView({
       const id = String(props.id ?? "");
       const label = String(props.label ?? "");
       const kind = String(props.kind ?? "");
+      const {
+        areas: latestAreas,
+        homeBases: latestHomeBases,
+        planningNfzs: latestPlanningNfzs,
+      } = editorDataRef.current;
       if (kind === "planning_area") {
-        const area = areas.find((candidate) => candidate.id === id);
+        const area = latestAreas.find((candidate) => candidate.id === id);
         const linkedBase = area?.linkedBaseId
-          ? homeBases.find((base) => base.id === area.linkedBaseId)
+          ? latestHomeBases.find((base) => base.id === area.linkedBaseId)
           : undefined;
         const backupBase = area?.backupBaseId
-          ? homeBases.find((base) => base.id === area.backupBaseId)
+          ? latestHomeBases.find((base) => base.id === area.backupBaseId)
           : undefined;
         const linkedText = linkedBase
           ? `Primary ${linkedBase.label}${linkedBase.available === false ? " offline" : ""}`
@@ -1107,9 +1178,9 @@ export function MapMissionView({
         };
       }
       if (kind === "home_base") {
-        const base = homeBases.find((candidate) => candidate.id === id);
-        const linkedAreas = areas.filter((area) => area.linkedBaseId === id);
-        const backupAreas = areas.filter((area) => area.backupBaseId === id);
+        const base = latestHomeBases.find((candidate) => candidate.id === id);
+        const linkedAreas = latestAreas.filter((area) => area.linkedBaseId === id);
+        const backupAreas = latestAreas.filter((area) => area.backupBaseId === id);
         const roleText = [
           linkedAreas.length > 0
             ? `Primary for ${linkedAreas.map((area) => area.label).join(", ")}`
@@ -1127,7 +1198,7 @@ export function MapMissionView({
         };
       }
       if (kind === "planning_nfz") {
-        const nfz = planningNfzs.find((candidate) => candidate.id === id);
+        const nfz = latestPlanningNfzs.find((candidate) => candidate.id === id);
         return {
           kind: "No-fly zone",
           label: (nfz?.label ?? label) || "Unnamed NFZ",
@@ -1150,6 +1221,42 @@ export function MapMissionView({
     };
 
     const popupSuppressed = () => performance.now() < popupSuppressedUntilRef.current;
+
+    const previewNfzDrag = (drag: NonNullable<typeof dragRef.current>) => {
+      if (drag.kind !== "nfz" || !drag.originalPolygon) return;
+      const { areas: latestAreas, homeBases: latestHomeBases, planningNfzs: latestPlanningNfzs } =
+        editorDataRef.current;
+      const {
+        draftPolygon: latestDraftPolygon,
+        editorMode: latestEditorMode,
+        selectedAreaId: latestSelectedAreaId,
+        selectedBaseId: latestSelectedBaseId,
+        selectedNfzId: latestSelectedNfzId,
+      } = editorViewRef.current;
+      const source = map.getSource("editor") as GeoJSONSource | undefined;
+      const previewNfzs = latestPlanningNfzs.map((nfz) =>
+        nfz.id === drag.id
+          ? {
+              ...nfz,
+              polygon: shiftPolygon(drag.originalPolygon ?? nfz.polygon, drag.totalDelta, drag.vertexIndex),
+            }
+          : nfz,
+      );
+      source?.setData({
+        type: "FeatureCollection",
+        features: editorFeatures({
+          mapPreset,
+          areas: latestAreas,
+          homeBases: latestHomeBases,
+          planningNfzs: previewNfzs,
+          draftPolygon: latestDraftPolygon,
+          editorMode: latestEditorMode,
+          selectedAreaId: latestSelectedAreaId,
+          selectedBaseId: latestSelectedBaseId,
+          selectedNfzId: latestSelectedNfzId,
+        }),
+      });
+    };
 
     const showEditorPopup = (event: MapMouseEvent, feature: Feature) => {
       if (popupSuppressed()) return;
@@ -1197,7 +1304,7 @@ export function MapMissionView({
         editorMode === "place_outbound_waypoint" ||
         editorMode === "place_inbound_waypoint"
       ) {
-        onMapPoint(localPoint(event));
+        callbacksRef.current.onMapPoint(localPoint(event));
         return;
       }
 
@@ -1210,7 +1317,7 @@ export function MapMissionView({
         );
         if (editorFeature?.properties?.entityKind && editorFeature.properties.id) {
           showEditorPopup(event, editorFeature as Feature);
-          onSelectEditorFeature(
+          callbacksRef.current.onSelectEditorFeature(
             editorFeature.properties.entityKind as EditorFeatureKind,
             String(editorFeature.properties.id),
           );
@@ -1228,7 +1335,7 @@ export function MapMissionView({
       });
       const uavFeature = features.find((feature) => feature.properties?.id);
       if (uavFeature?.properties?.id) {
-        onSelectUav(String(uavFeature.properties.id));
+        callbacksRef.current.onSelectUav(String(uavFeature.properties.id));
       }
     }
 
@@ -1248,17 +1355,24 @@ export function MapMissionView({
         vertexKind === "area_vertex" || vertexKind === "nfz_vertex"
           ? Number(editorFeature.properties.index)
           : undefined;
-      onSelectEditorFeature(kind, id);
+      callbacksRef.current.onSelectEditorFeature(kind, id);
       if (kind === "area" || kind === "nfz") {
         suppressEditorPopup();
       } else {
         popupRef.current?.remove();
       }
+      const startPoint = localPoint(event);
       dragRef.current = {
         kind,
         id,
         vertexIndex: Number.isFinite(vertexIndex) ? vertexIndex : undefined,
-        lastPoint: localPoint(event),
+        startPoint,
+        lastPoint: startPoint,
+        totalDelta: { x: 0, y: 0 },
+        originalPolygon:
+          kind === "nfz"
+            ? editorDataRef.current.planningNfzs.find((nfz) => nfz.id === id)?.polygon
+            : undefined,
         moved: false,
       };
       map.dragPan.disable();
@@ -1280,10 +1394,18 @@ export function MapMissionView({
       if (Math.hypot(delta.x, delta.y) < 0.1) return;
       drag.moved = true;
       drag.lastPoint = nextPoint;
+      drag.totalDelta = {
+        x: nextPoint.x - drag.startPoint.x,
+        y: nextPoint.y - drag.startPoint.y,
+      };
       if (drag.kind === "area" || drag.kind === "nfz") {
         suppressEditorPopup();
       }
-      onMoveEditorFeature(drag.kind, drag.id, delta, drag.vertexIndex);
+      if (drag.kind === "nfz") {
+        previewNfzDrag(drag);
+        return;
+      }
+      callbacksRef.current.onMoveEditorFeature(drag.kind, drag.id, delta, drag.vertexIndex);
     }
 
     function handleMouseUp() {
@@ -1292,6 +1414,15 @@ export function MapMissionView({
       if (!map) return;
       if (drag.moved && (drag.kind === "area" || drag.kind === "nfz")) {
         suppressEditorPopup(500);
+      }
+      if (drag.moved && !drag.committed) {
+        drag.committed = true;
+        callbacksRef.current.onCommitEditorFeatureMove(
+          drag.kind,
+          drag.id,
+          drag.totalDelta,
+          drag.vertexIndex,
+        );
       }
       map.dragPan.enable();
       map.getCanvas().style.cursor = editorMode === "select" ? "" : "crosshair";
@@ -1304,6 +1435,15 @@ export function MapMissionView({
       popupRef.current?.remove();
       if (!dragRef.current) return;
       if (!map) return;
+      if (dragRef.current.moved && !dragRef.current.committed) {
+        dragRef.current.committed = true;
+        callbacksRef.current.onCommitEditorFeatureMove(
+          dragRef.current.kind,
+          dragRef.current.id,
+          dragRef.current.totalDelta,
+          dragRef.current.vertexIndex,
+        );
+      }
       map.dragPan.enable();
       map.getCanvas().style.cursor = "";
       dragRef.current = null;
@@ -1370,17 +1510,10 @@ export function MapMissionView({
       }
     };
   }, [
-    areas,
     editorMode,
-    homeBases,
     loaded,
     mapPreset,
-    onMapPoint,
-    onMoveEditorFeature,
-    onSelectEditorFeature,
-    onSelectUav,
     plan,
-    planningNfzs,
   ]);
 
   useEffect(() => {

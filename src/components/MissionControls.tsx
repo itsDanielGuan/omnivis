@@ -3,9 +3,11 @@
 import { useEffect, useState } from "react";
 import {
   AlertTriangle,
+  BatteryCharging,
   Crosshair,
   Folder,
   Home,
+  Info,
   Link2,
   PlaneTakeoff,
   Plus,
@@ -41,6 +43,12 @@ type ActionMenu =
     }
   | null;
 
+type PendingDelete = {
+  kind: "area" | "base" | "nfz";
+  id: string;
+  label: string;
+} | null;
+
 type Props = {
   config: MissionConfig;
   demoMode: DemoMode;
@@ -64,7 +72,6 @@ type Props = {
   onSelectedNfzChange: (nfzId: string | undefined) => void;
   onFinishPolygon: () => void;
   onCancelDraft: () => void;
-  onDeleteSelected: () => void;
   onLinkBaseToArea: () => void;
   onLinkBackupBaseToArea: () => void;
   onRenameArea: (areaId: string, label: string) => void;
@@ -127,6 +134,62 @@ function commandButton(active: boolean) {
     : "border-white/10 bg-neutral-900 text-neutral-100 hover:bg-neutral-800";
 }
 
+function CoveragePathGraphic({
+  pattern,
+  compact = false,
+}: {
+  pattern: PathPattern;
+  compact?: boolean;
+}) {
+  const stroke = pattern === "nearest_infill" ? "#34d399" : pattern === "alternating_lanes" ? "#f59e0b" : "#38bdf8";
+  const d =
+    pattern === "nearest_infill"
+      ? "M18 70 L35 28 L57 56 L78 24 L96 64 L118 34"
+      : pattern === "alternating_lanes"
+        ? "M18 24 H118 M118 38 H18 M18 52 H118 M118 66 H18"
+        : "M18 24 H118 M18 38 H118 M18 52 H118 M18 66 H118";
+  return (
+    <svg
+      className={compact ? "h-16 w-full" : "h-20 w-full"}
+      viewBox="0 0 136 88"
+      role="img"
+      aria-label={`${pattern.replaceAll("_", " ")} coverage path preview`}
+    >
+      <path
+        d="M12 18 L122 14 L128 74 L20 78 Z"
+        fill="rgba(14,165,233,0.08)"
+        stroke="rgba(255,255,255,0.22)"
+        strokeWidth="1"
+      />
+      {[24, 38, 52, 66].map((y) => (
+        <path
+          key={y}
+          d={`M20 ${y} H116`}
+          stroke="rgba(255,255,255,0.16)"
+          strokeDasharray="2 4"
+          strokeWidth="1"
+        />
+      ))}
+      <path
+        d={d}
+        fill="none"
+        stroke={stroke}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="4"
+      />
+      <circle cx="15" cy="74" r="4" fill="#e5e5e5" />
+      <path d="M15 74 L24 66" stroke="rgba(229,229,229,0.8)" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+function coveragePathLabel(pattern: PathPattern) {
+  if (pattern === "nearest_infill") return "Nearest infill";
+  if (pattern === "alternating_lanes") return "Alternating lanes";
+  return "Sector lanes";
+}
+
 export function MissionControls({
   config,
   lossResponseMode,
@@ -148,7 +211,6 @@ export function MissionControls({
   onSelectedNfzChange,
   onFinishPolygon,
   onCancelDraft,
-  onDeleteSelected,
   onLinkBaseToArea,
   onLinkBackupBaseToArea,
   onRenameArea,
@@ -187,6 +249,7 @@ export function MissionControls({
   const spreadAvailable = operationMode === "full_signal";
   const pathPattern = config.pathPattern ?? "sector_lanes";
   const [actionMenu, setActionMenu] = useState<ActionMenu>(null);
+  const [pendingDelete, setPendingDelete] = useState<PendingDelete>(null);
 
   useEffect(() => {
     if (!actionMenu) return;
@@ -222,6 +285,35 @@ export function MissionControls({
   };
 
   const closeActionMenu = () => setActionMenu(null);
+
+  const deleteLabel = (kind: "area" | "base" | "nfz", id: string) => {
+    if (kind === "area") return areas.find((area) => area.id === id)?.label ?? "Unnamed zone";
+    if (kind === "base") return homeBases.find((base) => base.id === id)?.label ?? "Unnamed base";
+    return planningNfzs.find((nfz) => nfz.id === id)?.label ?? "Unnamed NFZ";
+  };
+
+  const requestDelete = (kind: "area" | "base" | "nfz", id: string) => {
+    setPendingDelete({ kind, id, label: deleteLabel(kind, id) });
+    closeActionMenu();
+  };
+
+  const requestSelectedDelete = () => {
+    if (selectedAreaId) {
+      requestDelete("area", selectedAreaId);
+    } else if (selectedBaseId) {
+      requestDelete("base", selectedBaseId);
+    } else if (selectedNfzId) {
+      requestDelete("nfz", selectedNfzId);
+    }
+  };
+
+  const confirmDelete = () => {
+    if (!pendingDelete) return;
+    if (pendingDelete.kind === "area") onDeleteArea(pendingDelete.id);
+    if (pendingDelete.kind === "base") onDeleteBase(pendingDelete.id);
+    if (pendingDelete.kind === "nfz") onDeleteNfz(pendingDelete.id);
+    setPendingDelete(null);
+  };
 
   return (
     <aside className="flex min-h-0 flex-col border-r border-white/10 bg-black">
@@ -280,7 +372,7 @@ export function MissionControls({
           <button
             className="inline-flex items-center justify-center gap-2 border border-white/10 bg-neutral-900 px-3 py-2 text-sm font-semibold text-neutral-100 transition hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-35"
             disabled={!canDeleteSelected}
-            onClick={onDeleteSelected}
+            onClick={requestSelectedDelete}
           >
             <Trash2 className="size-4" />
             Delete
@@ -779,6 +871,36 @@ export function MissionControls({
               }
             />
           </Field>
+          <Field label="RTB reserve" value={String(config.batteryReserveMin)} suffix=" min">
+            <input
+              className="w-full accent-neutral-200"
+              type="range"
+              min={5}
+              max={20}
+              step={1}
+              value={config.batteryReserveMin}
+              onChange={(event) =>
+                onConfigChange(updateNumber(config, "batteryReserveMin", Number(event.target.value)))
+              }
+            />
+          </Field>
+          <Field label="Recharge" value={String(config.rechargeDurationMin)} suffix=" min">
+            <input
+              className="w-full accent-neutral-200"
+              type="range"
+              min={5}
+              max={30}
+              step={1}
+              value={config.rechargeDurationMin}
+              onChange={(event) =>
+                onConfigChange(updateNumber(config, "rechargeDurationMin", Number(event.target.value)))
+              }
+            />
+          </Field>
+          <div className="flex items-start gap-2 border border-emerald-300/25 bg-emerald-400/10 p-2 text-xs text-emerald-100">
+            <BatteryCharging className="mt-0.5 size-3.5 shrink-0" />
+            UAVs automatically RTB near reserve, recharge, and relaunch for remaining strips.
+          </div>
           <Field label="Turn radius" value={String(config.turnRadiusM)} suffix=" m">
             <input
               className="w-full accent-neutral-200"
@@ -878,7 +1000,33 @@ export function MissionControls({
           <option value="full_signal">Full signal + GPS</option>
         </select>
         <label className="mb-3 block text-xs text-neutral-400">
-          Coverage path
+          <span className="flex items-center justify-between gap-2">
+            <span>Coverage path</span>
+            <span className="group relative inline-flex">
+              <Info className="size-3.5 text-neutral-500" />
+              <span className="pointer-events-none absolute right-0 top-5 z-30 hidden w-72 border border-white/10 bg-black p-2 shadow-2xl group-hover:block group-focus-within:block">
+                <span className="grid grid-cols-3 gap-2">
+                  {(["sector_lanes", "alternating_lanes", "nearest_infill"] as PathPattern[]).map(
+                    (candidate) => (
+                      <span
+                        key={candidate}
+                        className={`border p-1 ${
+                          candidate === pathPattern
+                            ? "border-white/30 bg-white/10"
+                            : "border-white/10 bg-neutral-950"
+                        }`}
+                      >
+                        <CoveragePathGraphic pattern={candidate} compact />
+                        <span className="block truncate text-center font-mono text-[9px] uppercase text-neutral-400">
+                          {coveragePathLabel(candidate)}
+                        </span>
+                      </span>
+                    ),
+                  )}
+                </span>
+              </span>
+            </span>
+          </span>
           <select
             className="mt-1 w-full border border-white/10 bg-black px-2 py-2 text-sm text-neutral-100 outline-none focus:border-white/30"
             value={pathPattern}
@@ -894,6 +1042,13 @@ export function MissionControls({
             <option value="nearest_infill">Nearest infill</option>
           </select>
         </label>
+        <div className="mb-3 border border-white/10 bg-black p-2">
+          <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wide text-neutral-500">
+            <span>{coveragePathLabel(pathPattern)}</span>
+            <span>Preview</span>
+          </div>
+          <CoveragePathGraphic pattern={pathPattern} />
+        </div>
         <div className="mb-3 border border-white/10 bg-black p-2 text-xs text-neutral-400">
           {operationMode === "full_signal"
             ? "GPS is available: replacement can continue from the loss point, or active UAVs can spread remaining work."
@@ -1004,16 +1159,55 @@ export function MissionControls({
             <button
               className="px-2 py-1.5 text-left text-red-200 hover:bg-red-500/15"
               onClick={() => {
-                if (actionMenu.kind === "area") onDeleteArea(actionMenu.id);
-                if (actionMenu.kind === "base") onDeleteBase(actionMenu.id);
-                if (actionMenu.kind === "nfz") onDeleteNfz(actionMenu.id);
-                closeActionMenu();
+                requestDelete(actionMenu.kind, actionMenu.id);
               }}
             >
               Delete
             </button>
           </div>
         </>
+      ) : null}
+      {pendingDelete ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="w-full max-w-sm border border-red-300/30 bg-neutral-950 p-4 shadow-2xl">
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="mt-0.5 size-4 shrink-0 text-red-300" />
+                <div>
+                  <div className="text-sm font-semibold text-red-100">
+                    Delete {pendingDelete.kind === "nfz" ? "NFZ" : pendingDelete.kind}
+                  </div>
+                  <div className="mt-1 text-xs text-neutral-400">
+                    You are about to delete{" "}
+                    <span className="font-semibold text-neutral-100">{pendingDelete.label}</span>.
+                    This cannot be undone and any compiled mission will be cleared.
+                  </div>
+                </div>
+              </div>
+              <button
+                className="text-neutral-500 transition hover:text-neutral-200"
+                aria-label="Cancel delete"
+                onClick={() => setPendingDelete(null)}
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                className="border border-white/10 bg-black px-3 py-2 text-sm font-semibold text-neutral-200 transition hover:bg-white/5"
+                onClick={() => setPendingDelete(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="border border-red-300/40 bg-red-500/15 px-3 py-2 text-sm font-semibold text-red-100 transition hover:bg-red-500/25"
+                onClick={confirmDelete}
+              >
+                Delete {pendingDelete.label}
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
     </aside>
   );

@@ -88,6 +88,15 @@ export function computeMissionMetrics(plan: MissionPlan): MissionMetrics {
   const blockedStripCount = plan.strips.filter(
     (strip) => strip.status === "blocked_by_nfz",
   ).length;
+  const rechargeCycleCount = plan.uavs.reduce(
+    (sum, uav) => sum + (uav.rechargeCount ?? 0),
+    0,
+  );
+  const forcedRtbCount = plan.uavs.reduce(
+    (sum, uav) => sum + (uav.forcedRtbCount ?? 0),
+    0,
+  );
+  const enduranceWarningCount = plan.uavs.filter((uav) => uav.enduranceWarning).length;
 
   return {
     coveragePct: estimateCoverage(plan),
@@ -101,7 +110,10 @@ export function computeMissionMetrics(plan: MissionPlan): MissionMetrics {
     completedStrips,
     coverageDebtStripCount,
     blockedStripCount,
-    feasible: missionCompletionTimeS <= plan.config.enduranceMin * 60,
+    rechargeCycleCount,
+    forcedRtbCount,
+    enduranceWarningCount,
+    feasible: coverageDebtStripCount === 0 && enduranceWarningCount === 0,
     rtbSpacingS: plan.config.rtbSlotSpacingS,
     before: plan.metrics?.before,
   };

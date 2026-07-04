@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  BatteryCharging,
   Eye,
   PlaneLanding,
   RadioTower,
@@ -45,6 +46,49 @@ export function UnitCard({
 
   const snapshot = getUavSnapshot(uav, simTimeS);
   const fullSignal = plan.config.commsPolicy === "full_signal";
+  const sortieStart =
+    [...uav.route]
+      .reverse()
+      .find(
+        (point) =>
+          point.t <= simTimeS && (point.phase === "preflight" || point.phase === "recharge"),
+      )?.t ?? 0;
+  const enduranceRemainingMin = Math.max(
+    0,
+    Math.round(plan.config.enduranceMin - (simTimeS - sortieStart) / 60),
+  );
+  const routeEndS = uav.route.at(-1)?.t ?? simTimeS;
+  const boundedTimeS = Math.max(uav.route[0]?.t ?? 0, Math.min(simTimeS, routeEndS));
+  const reservePct = Math.max(
+    0,
+    Math.min(100, (plan.config.batteryReserveMin / plan.config.enduranceMin) * 100),
+  );
+  const rechargeIndex = uav.route.findIndex((point, index) => {
+    const previous = uav.route[index - 1];
+    return point.phase === "recharge" && previous && boundedTimeS >= previous.t && boundedTimeS < point.t;
+  });
+  const batteryPct =
+    rechargeIndex > 0
+      ? Math.max(
+          reservePct,
+          Math.min(
+            100,
+            reservePct +
+              ((boundedTimeS - uav.route[rechargeIndex - 1].t) /
+                Math.max(1, uav.route[rechargeIndex].t - uav.route[rechargeIndex - 1].t)) *
+                (100 - reservePct),
+          ),
+        )
+      : Math.max(
+          0,
+          Math.min(100, 100 - ((boundedTimeS - sortieStart) / (plan.config.enduranceMin * 60)) * 100),
+        );
+  const batteryColor =
+    batteryPct <= reservePct + 5
+      ? "bg-red-500"
+      : batteryPct <= reservePct + 20
+        ? "bg-amber-500"
+        : "bg-emerald-400";
 
   return (
     <section className="shrink-0 border border-white/10 bg-neutral-950 p-3">
@@ -73,11 +117,7 @@ export function UnitCard({
         <div className="border border-white/10 bg-black p-2">
           <span className="block text-neutral-500">Endurance remain</span>
           <span className="font-mono text-neutral-100">
-            {Math.max(
-              0,
-              Math.round(plan.config.enduranceMin - simTimeS / 60),
-            )}
-            m
+            {enduranceRemainingMin}m
           </span>
         </div>
         <div className="border border-white/10 bg-black p-2">
@@ -85,6 +125,36 @@ export function UnitCard({
           <span className="font-mono text-neutral-100">
             {formatMissionClock(uav.rtbSlotS)}
           </span>
+        </div>
+      </div>
+
+      <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
+        <div className="border border-white/10 bg-black p-2">
+          <span className="flex items-center gap-1 text-neutral-500">
+            <BatteryCharging className="size-3.5" />
+            Recharge cycles
+          </span>
+          <span className="font-mono text-neutral-100">{uav.rechargeCount ?? 0}</span>
+        </div>
+        <div className="border border-white/10 bg-black p-2">
+          <span className="block text-neutral-500">Reserve RTB</span>
+          <span className="font-mono text-neutral-100">{uav.forcedRtbCount ?? 0}</span>
+        </div>
+      </div>
+      {uav.enduranceWarning ? (
+        <div className="mt-2 border border-amber-300/25 bg-amber-400/10 p-2 text-xs text-amber-100">
+          {uav.enduranceWarning}
+        </div>
+      ) : null}
+      <div className="mt-2 border border-white/10 bg-black p-2">
+        <div className="mb-1 flex items-center justify-between text-xs text-neutral-500">
+          <span>Battery level</span>
+          <span className="font-mono text-neutral-100">
+            {rechargeIndex > 0 ? "Charging" : `${Math.round(batteryPct)}%`}
+          </span>
+        </div>
+        <div className="h-2 w-full overflow-hidden bg-neutral-800">
+          <span className={`block h-full ${batteryColor}`} style={{ width: `${batteryPct}%` }} />
         </div>
       </div>
 

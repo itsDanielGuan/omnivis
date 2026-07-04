@@ -16,6 +16,7 @@ import { buildRouteFromStart } from "@/lib/planner";
 import {
   buildReturnRouteViaBaseWaypoint,
   normalizeHomeBase,
+  pointInsideNfz,
   routeIntersectsAnyNfz,
   safePathLength,
 } from "@/lib/routing";
@@ -118,8 +119,71 @@ function pendingAssignedStrips(
   return plan.strips.filter((strip) => {
     if (strip.assignedUavId !== uav.id) return false;
     if (strip.status === "blocked_by_nfz") return false;
-    return stripCompletionTime(uav.originalRoute ?? uav.route, strip.id) > timeS;
+    return stripCompletionTime(uav.route, strip.id) > timeS;
   });
+}
+
+function hasFutureNfzDetour(route: RouteWaypoint[], timeS: number): boolean {
+  return route.some(
+    (point) =>
+      point.t > timeS &&
+      (point.phase === "detour" || point.label?.toLowerCase().includes("nfz")),
+  );
+}
+
+function nearestPointOnSegment(a: Point, b: Point, point: Point): Point {
+  const lengthSq = (b.x - a.x) ** 2 + (b.y - a.y) ** 2;
+  if (lengthSq === 0) return a;
+  const t = Math.max(
+    0,
+    Math.min(1, ((point.x - a.x) * (b.x - a.x) + (point.y - a.y) * (b.y - a.y)) / lengthSq),
+  );
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+  };
+}
+
+function nearestPolygonEgressPoint(point: Point, nfz: Nfz, clearanceM: number): Point | undefined {
+  const polygon = nfz.polygon;
+  if (!polygon || polygon.length < 3) return undefined;
+  const boundary = polygon.reduce((nearest, vertex, index) => {
+    const next = polygon[(index + 1) % polygon.length];
+    const candidate = nearestPointOnSegment(vertex, next, point);
+    return distance(candidate, point) < distance(nearest, point) ? candidate : nearest;
+  }, nearestPointOnSegment(polygon[0], polygon[1], point));
+  const dx = boundary.x - nfz.center.x;
+  const dy = boundary.y - nfz.center.y;
+  const length = Math.hypot(dx, dy) || 1;
+  return {
+    x: boundary.x + (dx / length) * clearanceM,
+    y: boundary.y + (dy / length) * clearanceM,
+  };
+}
+
+function egressPointOutsideNfzs(point: Point, nfzs: Nfz[], clearanceM: number): Point | undefined {
+  let cursor = { x: point.x, y: point.y };
+  let moved = false;
+  for (let guard = 0; guard < 5; guard += 1) {
+    const containingNfz = nfzs.find((nfz) => pointInsideNfz(cursor, nfz));
+    if (!containingNfz) return moved ? cursor : undefined;
+    const polygonEgress = nearestPolygonEgressPoint(cursor, containingNfz, clearanceM);
+    if (polygonEgress) {
+      cursor = polygonEgress;
+      moved = true;
+      continue;
+    }
+    const dx = cursor.x - containingNfz.center.x;
+    const dy = cursor.y - containingNfz.center.y;
+    const length = Math.hypot(dx, dy) || 1;
+    const radius = Math.max(containingNfz.radiusM, 1) + clearanceM;
+    cursor = {
+      x: containingNfz.center.x + (dx / length) * radius,
+      y: containingNfz.center.y + (dy / length) * radius,
+    };
+    moved = true;
+  }
+  return moved ? cursor : undefined;
 }
 
 function recomputeUavUtilization(uav: UavPlan) {
@@ -134,24 +198,57 @@ function buildContinuationForUav(
   strips: CoverageStrip[],
   startTimeS: number,
   uavIndex: number,
-  rtbAnchorS: number,
 ) {
-  const prefix = routeAtOrBefore(uav.route, startTimeS);
-  const current = prefix[prefix.length - 1] ?? interpolateRoute(uav.route, startTimeS);
-  const build = buildRouteFromStart(
+  const current = interpolateRoute(uav.route, startTimeS);
+  const prefix = [
+    ...routeAtOrBefore(uav.route, startTimeS).filter((point) => point.t < startTimeS - 0.1),
+    {
+      ...current,
+      t: startTimeS,
+      label: current.label ?? "live replan handoff",
+    },
+  ];
+  const egressPoint = egressPointOutsideNfzs(
     current,
-    startTimeS,
+    plan.nfzs,
+    Math.max(35, Math.min(85, plan.config.sensorSwathM * 0.25)),
+  );
+  const egressRoute: RouteWaypoint[] = [];
+  let buildStart: Point = current;
+  let buildStartTimeS = startTimeS;
+  if (egressPoint) {
+    buildStartTimeS += distance(current, egressPoint) / plan.config.speedMps;
+    egressRoute.push({
+      ...egressPoint,
+      t: buildStartTimeS,
+      phase: "detour",
+      label: "NFZ egress",
+    });
+    buildStart = egressPoint;
+  }
+  const build = buildRouteFromStart(
+    buildStart,
+    buildStartTimeS,
     strips,
     plan.config,
     plan.homeBase,
     uavIndex,
-    rtbAnchorS,
     false,
     plan.nfzs,
   );
   uav.originalRoute = uav.originalRoute ?? uav.route;
-  uav.route = [...prefix, ...build.route.slice(1)];
+  uav.route = [...prefix, ...egressRoute, ...build.route.slice(1)];
   uav.coverageTimeS = build.coverageTimeS;
+  uav.rechargeCount = build.rechargeCount;
+  uav.forcedRtbCount = build.forcedRtbCount;
+  uav.enduranceWarning = build.enduranceWarning;
+  build.skippedStripIds.forEach((stripId) => {
+    const strip = plan.strips.find((candidate) => candidate.id === stripId);
+    if (strip) strip.status = "coverage_debt";
+  });
+  uav.assignedStripIds = plan.strips
+    .filter((strip) => strip.assignedUavId === uav.id && strip.status !== "coverage_debt")
+    .map((strip) => strip.id);
   recomputeUavUtilization(uav);
 }
 
@@ -181,6 +278,29 @@ function unfinishedRedistributionStrips(
       return stripCompletionTime(sourceOwner.originalRoute ?? sourceOwner.route, strip.id) > timeS;
     })
     .sort((a, b) => a.order - b.order);
+}
+
+function stripIntersectsNfz(strip: CoverageStrip, nfz: Nfz, swathM: number): boolean {
+  if (nfz.polygon?.length) {
+    return (
+      pointInPolygon(strip.center, nfz.polygon) ||
+      segmentIntersectsPolygon(strip.start, strip.end, nfz.polygon)
+    );
+  }
+  return segmentDistanceToPoint(strip.start, strip.end, nfz.center) <= nfz.radiusM + swathM * 0.5;
+}
+
+function remarkNfzBlockedStrips(plan: MissionPlan): CoverageStrip[] {
+  const blocked: CoverageStrip[] = [];
+  plan.strips.forEach((strip) => {
+    if (strip.status === "coverage_debt" || strip.status === "completed") return;
+    const isBlocked = plan.nfzs.some((nfz) =>
+      stripIntersectsNfz(strip, nfz, plan.config.sensorSwathM),
+    );
+    strip.status = isBlocked ? "blocked_by_nfz" : "planned";
+    if (isBlocked) blocked.push(strip);
+  });
+  return blocked;
 }
 
 function redistributeRemainingStripsGreedy(
@@ -297,6 +417,7 @@ export function getCurrentTask(uav: UavPlan, timeS: number): string {
   if (point.phase === "return") return "Return-to-base corridor";
   if (point.phase === "detour") return "NFZ detour";
   if (point.phase === "replacement") return "Replacement insertion";
+  if (point.phase === "recharge") return point.label ?? "Battery recharge at base";
   return point.label ?? point.phase;
 }
 
@@ -384,8 +505,6 @@ export function applyVehicleLoss(
   );
 
   const activeUavs = plan.uavs.filter((uav) => uav.status !== "lost" && !uav.reserve);
-  const rtbAnchorS = lossDetectedAtS + 420;
-
   if (!fullSignal && mode === "spread_remaining_swarm") {
     addEvent(
       plan,
@@ -416,7 +535,6 @@ export function applyVehicleLoss(
       plan.config,
       plan.homeBase,
       failedIndex >= 0 ? failedIndex : plan.uavs.length,
-      rtbAnchorS,
       !fullSignal,
       plan.nfzs,
     );
@@ -452,7 +570,17 @@ export function applyVehicleLoss(
       rtbSlotS: build.route.at(-1)?.t ?? 0,
       coverageTimeS: build.coverageTimeS,
       utilizationPct: 0,
+      rechargeCount: build.rechargeCount,
+      forcedRtbCount: build.forcedRtbCount,
+      enduranceWarning: build.enduranceWarning,
     };
+    build.skippedStripIds.forEach((stripId) => {
+      const strip = plan.strips.find((candidate) => candidate.id === stripId);
+      if (strip) strip.status = "coverage_debt";
+    });
+    replacement.assignedStripIds = plan.strips
+      .filter((strip) => strip.assignedUavId === replacementId && strip.status !== "coverage_debt")
+      .map((strip) => strip.id);
     recomputeUavUtilization(replacement);
     plan.uavs.push(replacement);
     addMessage(
@@ -486,7 +614,7 @@ export function applyVehicleLoss(
       uav.assignedStripIds = plan.strips
         .filter((strip) => strip.assignedUavId === uav.id)
         .map((strip) => strip.id);
-      buildContinuationForUav(plan, uav, future, lossDetectedAtS + index * 8, index, rtbAnchorS);
+      buildContinuationForUav(plan, uav, future, lossDetectedAtS + index * 8, index);
     });
     addMessage(
       plan,
@@ -544,23 +672,7 @@ export function applyNfz(
   };
   plan.nfzs.push(nfz);
 
-  const blocked = plan.strips.filter((strip) => {
-    if (strip.status === "coverage_debt") return false;
-    if (nfz.polygon?.length) {
-      return (
-        pointInPolygon(strip.center, nfz.polygon) ||
-        segmentIntersectsPolygon(strip.start, strip.end, nfz.polygon)
-      );
-    }
-    return (
-      segmentDistanceToPoint(strip.start, strip.end, nfz.center) <=
-      nfz.radiusM + plan.config.sensorSwathM * 0.5
-    );
-  });
-  blocked.forEach((blockedStrip) => {
-    const strip = plan.strips.find((candidate) => candidate.id === blockedStrip.id);
-    if (strip) strip.status = "blocked_by_nfz";
-  });
+  const blocked = remarkNfzBlockedStrips(plan);
 
   plan.uavs
     .filter((uav) => uav.status !== "lost")
@@ -573,15 +685,17 @@ export function applyNfz(
       const blockedFutureWork = uav.assignedStripIds.some((stripId) => {
         const strip = plan.strips.find((candidate) => candidate.id === stripId);
         if (!strip || strip.status !== "blocked_by_nfz") return false;
-        return stripCompletionTime(uav.originalRoute ?? uav.route, strip.id) > replanTimeS;
+        return stripCompletionTime(uav.route, strip.id) > replanTimeS;
       });
-      if (!routeIntersectsAnyNfz(futureRoute, plan.nfzs) && !blockedFutureWork) return;
+      const routeBlocked = routeIntersectsAnyNfz(futureRoute, plan.nfzs);
+      const shouldRefreshPath = routeBlocked || blockedFutureWork || hasFutureNfzDetour(uav.route, replanTimeS);
+      if (!shouldRefreshPath) return;
 
+      uav.status = "replanned";
       const future = pendingAssignedStrips(plan, uav, replanTimeS).sort(
         (a, b) => a.order - b.order,
       );
-      uav.status = "replanned";
-      buildContinuationForUav(plan, uav, future, replanTimeS, index, timeS + 420);
+      buildContinuationForUav(plan, uav, future, replanTimeS, index);
     });
 
   addMessage(
@@ -598,6 +712,78 @@ export function applyNfz(
     timeS + 6,
     "danger",
     `${nfz.id} placed; ${blocked.length} strip envelopes blocked and affected routes detoured`,
+    source?.id,
+  );
+
+  plan.metrics = computeMissionMetrics(plan);
+  return plan;
+}
+
+export function applyNfzSetUpdate(
+  sourcePlan: MissionPlan,
+  nfzs: Nfz[],
+  requestedTimeS: number,
+  sourceUavId?: string,
+  label = "NFZ geometry",
+): MissionPlan {
+  const plan = clonePlan(sourcePlan);
+  plan.metrics.before = {
+    coveragePct: sourcePlan.metrics.coveragePct,
+    missionCompletionTimeS: sourcePlan.metrics.missionCompletionTimeS,
+    messagesUsed: sourcePlan.metrics.messagesUsed,
+    coverageDebtStripCount: sourcePlan.metrics.coverageDebtStripCount,
+  };
+  plan.activeContingency = "nfz";
+
+  const timeS = Math.max(0, requestedTimeS);
+  plan.nfzs = nfzs.map((nfz) => ({ ...nfz, createdAtS: timeS }));
+  const source =
+    plan.uavs.find((uav) => uav.id === sourceUavId && uav.status !== "lost") ??
+    plan.uavs.find((uav) => uav.status !== "lost");
+  const blocked = remarkNfzBlockedStrips(plan);
+
+  plan.uavs
+    .filter((uav) => uav.status !== "lost" && !uav.reserve)
+    .forEach((uav, index) => {
+      const routeEndS = uav.route.at(-1)?.t ?? 0;
+      if (timeS >= routeEndS - 1) return;
+      const replanTimeS = Math.min(routeEndS - 1, timeS + index * 3);
+      const futureRoute: RouteWaypoint[] = [
+        interpolateRoute(uav.route, replanTimeS),
+        ...uav.route.filter((point) => point.t > replanTimeS),
+      ];
+      const blockedFutureWork = uav.assignedStripIds.some((stripId) => {
+        const strip = plan.strips.find((candidate) => candidate.id === stripId);
+        if (!strip || strip.status !== "blocked_by_nfz") return false;
+        return stripCompletionTime(uav.route, strip.id) > replanTimeS;
+      });
+      const routeBlocked = routeIntersectsAnyNfz(futureRoute, plan.nfzs);
+      const shouldRefreshPath = routeBlocked || blockedFutureWork || hasFutureNfzDetour(uav.route, replanTimeS);
+      if (!shouldRefreshPath) return;
+
+      uav.status = "replanned";
+      const future = pendingAssignedStrips(plan, uav, replanTimeS).sort(
+        (a, b) => a.order - b.order,
+      );
+      buildContinuationForUav(plan, uav, future, replanTimeS, index);
+    });
+
+  addMessage(
+    plan,
+    timeS + 5,
+    "NFZ_EXCEPTION_TOKEN",
+    source?.id ?? "UAV_1",
+    `${label} updated; all UAVs recompute safe future branches from current positions`,
+    undefined,
+    plan.uavs
+      .filter((uav) => uav.status !== "lost" && !uav.reserve)
+      .map((uav) => uav.id),
+  );
+  addEvent(
+    plan,
+    timeS + 6,
+    "warning",
+    `${label} updated; ${blocked.length} strip envelopes blocked and active UAVs continue from live positions`,
     source?.id,
   );
 
@@ -643,7 +829,7 @@ export function applyBaseOfflineFailover(
         (a, b) => a.order - b.order,
       );
       uav.status = uav.status === "regained" ? "regained" : "replanned";
-      buildContinuationForUav(plan, uav, future, replanTimeS, index, timeS + 360);
+      buildContinuationForUav(plan, uav, future, replanTimeS, index);
       replannedCount += 1;
     });
 

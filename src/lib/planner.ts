@@ -41,6 +41,10 @@ type RouteBuildResult = {
   coverageTimeS: number;
   coverageEndS: number;
   endPoint: Point;
+  rechargeCount: number;
+  forcedRtbCount: number;
+  skippedStripIds: string[];
+  enduranceWarning?: string;
 };
 
 function waypoint(
@@ -116,6 +120,48 @@ function stripTraverseCost(
   };
 }
 
+function enduranceBudgetS(config: MissionConfig) {
+  return Math.max(60, (config.enduranceMin - config.batteryReserveMin) * 60);
+}
+
+function rechargeDurationS(config: MissionConfig) {
+  return Math.max(60, config.rechargeDurationMin * 60);
+}
+
+function appendLaunchSequence(
+  route: RouteWaypoint[],
+  config: MissionConfig,
+  uavIndex: number,
+  nfzs: Nfz[],
+  homeBase: HomeBase | undefined,
+  firstSectorTarget: Point,
+) {
+  const start = route[route.length - 1];
+  if (!start) return;
+  const launchPoint = {
+    x: start.x + 180 + uavIndex * 45,
+    y: start.y + 170 + uavIndex * 95,
+  };
+  appendSafeLeg(route, launchPoint, config.speedMps, "launch", nfzs, uavIndex, {
+    label: "staggered launch corridor",
+  });
+
+  if (!homeBase) return;
+  const outbound = selectBaseWaypoint({
+    base: homeBase,
+    direction: "outbound",
+    from: launchPoint,
+    to: firstSectorTarget,
+    nfzs,
+    uavIndex,
+  });
+  if (outbound) {
+    appendSafeLeg(route, outbound.point, config.speedMps, "transit", nfzs, uavIndex, {
+      label: `outbound waypoint ${outbound.label}`,
+    });
+  }
+}
+
 export function orderCoverageStripsForPathPattern(
   strips: CoverageStrip[],
   config: MissionConfig,
@@ -167,39 +213,64 @@ function buildCoverageRoute(
   const orderedStrips = orderCoverageStripsForPathPattern(strips, config, start, uavIndex, nfzs);
   const route: RouteWaypoint[] = [waypoint(start, startTimeS, includeLaunch ? "preflight" : "transit")];
   let coverageTimeS = 0;
+  let sortieStartS = startTimeS;
+  let rechargeCount = 0;
+  let forcedRtbCount = 0;
+  const skippedStripIds: string[] = [];
+  const firstSectorTarget = orderedStrips[0]?.center ?? start;
 
   if (includeLaunch) {
-    const launchPoint = {
-      x: start.x + 180 + uavIndex * 45,
-      y: start.y + 170 + uavIndex * 95,
-    };
-    appendSafeLeg(route, launchPoint, config.speedMps, "launch", nfzs, uavIndex, {
-      label: "staggered launch corridor",
-    });
-
-    const firstSectorTarget = orderedStrips[0]?.center ?? launchPoint;
-    if (homeBase) {
-      const outbound = selectBaseWaypoint({
-        base: homeBase,
-        direction: "outbound",
-        from: launchPoint,
-        to: firstSectorTarget,
-        nfzs,
-        uavIndex,
-      });
-      if (outbound) {
-        appendSafeLeg(route, outbound.point, config.speedMps, "transit", nfzs, uavIndex, {
-          label: `outbound waypoint ${outbound.label}`,
-        });
-      }
-    }
+    appendLaunchSequence(route, config, uavIndex, nfzs, homeBase, firstSectorTarget);
   }
 
   orderedStrips.forEach((strip, idx) => {
-    const current = route[route.length - 1];
+    let current = route[route.length - 1];
     const startsAtA = distance(current, strip.start) <= distance(current, strip.end);
-    const entry = startsAtA ? strip.start : strip.end;
-    const exit = startsAtA ? strip.end : strip.start;
+    let entry = startsAtA ? strip.start : strip.end;
+    let exit = startsAtA ? strip.end : strip.start;
+    if (homeBase) {
+      const requiredS =
+        (safePathLength(current, entry, nfzs, uavIndex) +
+          safePathLength(entry, exit, nfzs, uavIndex) +
+          safePathLength(exit, homeBase.point, nfzs, uavIndex)) /
+        config.speedMps;
+      const elapsedS = current.t - sortieStartS;
+      if (elapsedS + requiredS > enduranceBudgetS(config)) {
+        forcedRtbCount += 1;
+        appendRtb(
+          route,
+          homeBase,
+          config,
+          uavIndex,
+          current.t + safePathLength(current, homeBase.point, nfzs, uavIndex) / config.speedMps + 60,
+          nfzs,
+        );
+        const basePoint = route[route.length - 1] ?? homeBase.point;
+        const rechargeEndS = basePoint.t + rechargeDurationS(config);
+        route.push(waypoint(homeBase.point, rechargeEndS, "recharge", {
+          label: `battery recharge ${config.rechargeDurationMin} min`,
+        }));
+        rechargeCount += 1;
+        sortieStartS = rechargeEndS;
+        appendLaunchSequence(route, config, uavIndex, nfzs, homeBase, strip.center);
+        current = route[route.length - 1];
+      }
+
+      const freshStartsAtA = distance(current, strip.start) <= distance(current, strip.end);
+      const freshEntry = freshStartsAtA ? strip.start : strip.end;
+      const freshExit = freshStartsAtA ? strip.end : strip.start;
+      entry = freshEntry;
+      exit = freshExit;
+      const freshRequiredS =
+        (safePathLength(current, freshEntry, nfzs, uavIndex) +
+          safePathLength(freshEntry, freshExit, nfzs, uavIndex) +
+          safePathLength(freshExit, homeBase.point, nfzs, uavIndex)) /
+        config.speedMps;
+      if (current.t - sortieStartS + freshRequiredS > enduranceBudgetS(config)) {
+        skippedStripIds.push(strip.id);
+        return;
+      }
+    }
     appendSafeLeg(route, entry, config.speedMps, "transit", nfzs, uavIndex, {
       stripId: strip.id,
       label: idx === 0 ? "sector entry" : "next strip",
@@ -217,6 +288,15 @@ function buildCoverageRoute(
     coverageTimeS,
     coverageEndS: route[route.length - 1]?.t ?? startTimeS,
     endPoint: route[route.length - 1] ?? start,
+    rechargeCount,
+    forcedRtbCount,
+    skippedStripIds,
+    enduranceWarning:
+      skippedStripIds.length > 0
+        ? `${skippedStripIds.length} strip${skippedStripIds.length === 1 ? "" : "s"} exceed one sortie with RTB reserve`
+        : forcedRtbCount > 0
+          ? `${forcedRtbCount} reserve-triggered RTB cycle${forcedRtbCount === 1 ? "" : "s"} inserted`
+          : undefined,
   };
 }
 
@@ -273,7 +353,6 @@ export function buildRouteFromStart(
   config: MissionConfig,
   base: Point | HomeBase,
   uavIndex: number,
-  rtbAnchorS: number,
   includeLaunch = false,
   nfzs: Nfz[] = [],
 ): RouteBuildResult {
@@ -291,7 +370,7 @@ export function buildRouteFromStart(
   );
   const desiredArrivalS = Math.max(
     result.coverageEndS + safePathLength(result.endPoint, homeBase.point, nfzs, uavIndex) / config.speedMps + 60,
-    rtbAnchorS + uavIndex * config.rtbSlotSpacingS,
+    result.coverageEndS,
   );
   appendRtb(result.route, homeBase, config, uavIndex, desiredArrivalS, nfzs);
   return result;
@@ -359,22 +438,6 @@ function buildMissionPlan(
   });
   const uavIds = Array.from({ length: config.uavCount }, (_, index) => `UAV_${index + 1}`);
 
-  const coverageBuilds = uavIds.map((uavId, index) =>
-    buildCoverageRoute(
-      basePoint,
-      index * 12,
-      assignedStrips.filter(
-        (strip) => strip.assignedUavId === uavId && strip.status !== "blocked_by_nfz",
-      ),
-      config,
-      index,
-      true,
-      nfzs,
-      homeBase,
-    ),
-  );
-  const rtbAnchorS = Math.max(...coverageBuilds.map((build) => build.coverageEndS)) + 210;
-
   const uavs: UavPlan[] = uavIds.map((uavId, index) => {
     const strips = assignedStrips.filter((strip) => strip.assignedUavId === uavId);
     const routeStrips = strips.filter((strip) => strip.status !== "blocked_by_nfz");
@@ -385,11 +448,17 @@ function buildMissionPlan(
       config,
       homeBase,
       index,
-      rtbAnchorS,
       true,
       nfzs,
     );
+    build.skippedStripIds.forEach((stripId) => {
+      const skipped = assignedStrips.find((strip) => strip.id === stripId);
+      if (skipped) skipped.status = "coverage_debt";
+    });
     const routeEnd = build.route[build.route.length - 1]?.t ?? 1;
+    const assignedStripIds = strips
+      .filter((strip) => strip.status !== "coverage_debt")
+      .map((strip) => strip.id);
     return {
       id: uavId,
       label: `UAV-${index + 1}`,
@@ -397,11 +466,14 @@ function buildMissionPlan(
       colorSoft: UAV_COLORS[index].soft,
       altitudeM: config.altitudeLayerStartM + index * config.altitudeLayerSpacingM,
       status: "active",
-      assignedStripIds: strips.map((strip) => strip.id),
+      assignedStripIds,
       route: build.route,
       rtbSlotS: build.route[build.route.length - 1]?.t ?? 0,
       coverageTimeS: build.coverageTimeS,
       utilizationPct: Math.min(100, (build.coverageTimeS / routeEnd) * 100),
+      rechargeCount: build.rechargeCount,
+      forcedRtbCount: build.forcedRtbCount,
+      enduranceWarning: build.enduranceWarning,
     };
   });
 
@@ -424,13 +496,22 @@ function buildMissionPlan(
       config,
       homeBase,
       index,
-      rtbAnchorS,
       true,
       nfzs,
     );
+    rebuilt.skippedStripIds.forEach((stripId) => {
+      const skipped = assignedStrips.find((strip) => strip.id === stripId);
+      if (skipped) skipped.status = "coverage_debt";
+    });
     uav.originalRoute = uav.route;
     uav.route = rebuilt.route;
     uav.coverageTimeS = rebuilt.coverageTimeS;
+    uav.rechargeCount = rebuilt.rechargeCount;
+    uav.forcedRtbCount = rebuilt.forcedRtbCount;
+    uav.enduranceWarning = rebuilt.enduranceWarning;
+    uav.assignedStripIds = assignedStrips
+      .filter((strip) => strip.assignedUavId === uav.id && strip.status !== "coverage_debt")
+      .map((strip) => strip.id);
     uav.rtbSlotS = rebuilt.route.at(-1)?.t ?? uav.rtbSlotS;
     const routeEnd = rebuilt.route.at(-1)?.t ?? 1;
     uav.utilizationPct = Math.min(100, (uav.coverageTimeS / routeEnd) * 100);
@@ -461,6 +542,9 @@ function buildMissionPlan(
       completedStrips: 0,
       coverageDebtStripCount: 0,
       blockedStripCount: 0,
+      rechargeCycleCount: 0,
+      forcedRtbCount: 0,
+      enduranceWarningCount: 0,
       feasible: true,
       rtbSpacingS: config.rtbSlotSpacingS,
     },

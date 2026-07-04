@@ -49,7 +49,8 @@ export type RoutePhase =
   | "lost"
   | "reserve"
   | "replacement"
-  | "regained";
+  | "regained"
+  | "recharge";
 
 export type UavStatus =
   | "ready"
@@ -76,6 +77,8 @@ export type MissionConfig = {
   overlapRatio: number;
   speedMps: number;
   enduranceMin: number;
+  batteryReserveMin: number;
+  rechargeDurationMin: number;
   minSeparationM: number;
   altitudeLayerStartM: number;
   altitudeLayerSpacingM: number;
@@ -166,6 +169,9 @@ export type UavPlan = {
   utilizationPct: number;
   coverageTimeS: number;
   reserve?: boolean;
+  rechargeCount?: number;
+  forcedRtbCount?: number;
+  enduranceWarning?: string;
   communicationLostAtS?: number;
   lossDetectedAtS?: number;
   lostAtS?: number;
@@ -222,6 +228,9 @@ export type MissionMetrics = {
   completedStrips: number;
   coverageDebtStripCount: number;
   blockedStripCount: number;
+  rechargeCycleCount: number;
+  forcedRtbCount: number;
+  enduranceWarningCount: number;
   feasible: boolean;
   rtbSpacingS: number;
   before?: {

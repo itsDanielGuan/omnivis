@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ExportPanel } from "@/components/ExportPanel";
 import { Header } from "@/components/Header";
 import { MapMissionView } from "@/components/MapMissionView";
@@ -17,6 +17,7 @@ import { normalizeHomeBase } from "@/lib/routing";
 import {
   applyBaseOfflineFailover,
   applyNfz,
+  applyNfzSetUpdate,
   applySignalRegain,
   applyVehicleLoss,
   armRtbDemo,
@@ -186,6 +187,11 @@ export function OmniVisApp() {
   const [playbackRate, setPlaybackRate] = useState(30);
   const mapPreset = useMemo(() => getMapPreset(config.mapPresetId), [config.mapPresetId]);
   const maxTimeS = useMemo(() => getMissionMaxTime(plan), [plan]);
+  const planningNfzsRef = useRef(planningNfzs);
+
+  useEffect(() => {
+    planningNfzsRef.current = planningNfzs;
+  }, [planningNfzs]);
 
   useEffect(() => {
     const payload: PersistedPlanningState = {
@@ -278,6 +284,14 @@ export function OmniVisApp() {
       ...next,
       commsPolicy: next.commsPolicy === "full_signal" ? "full_signal" : "silent_operation",
       pathPattern: next.pathPattern ?? "sector_lanes",
+      batteryReserveMin: Math.min(
+        Math.max(1, next.batteryReserveMin ?? DEFAULT_CONFIG.batteryReserveMin),
+        Math.max(1, next.enduranceMin - 1),
+      ),
+      rechargeDurationMin: Math.max(
+        1,
+        next.rechargeDurationMin ?? DEFAULT_CONFIG.rechargeDurationMin,
+      ),
     };
     if (normalizedNext.commsPolicy !== "full_signal") {
       setLossResponseMode("dispatch_replacement");
@@ -394,16 +408,6 @@ export function OmniVisApp() {
     setEditorMode("select");
   };
 
-  const deleteSelected = () => {
-    if (selectedAreaId) {
-      deleteArea(selectedAreaId);
-    } else if (selectedBaseId) {
-      deleteBase(selectedBaseId);
-    } else if (selectedNfzId) {
-      deleteNfz(selectedNfzId);
-    }
-  };
-
   const deleteArea = (areaId: string) => {
     setAreas((current) => current.filter((area) => area.id !== areaId));
     if (selectedAreaId === areaId) setSelectedAreaId(undefined);
@@ -495,36 +499,20 @@ export function OmniVisApp() {
     setSelectedBaseId(undefined);
 
     if (!plan) return;
-    if (enabling) {
-      setPlan(applyNfz(plan, target.polygon, simTimeS, selectedUavId));
-      return;
-    }
-
-    const area = selectedArea ?? areas[0];
-    if (!area) {
-      setPlan(null);
-      return;
-    }
-    const base = resolveAreaHomeBase(area, homeBases, selectedBase);
-    if (!base) {
-      setPlan(null);
-      return;
-    }
-    const enabledNfzs = nextPlanningNfzs
+    const activeNfzs = nextPlanningNfzs
       .filter((nfz) => nfz.enabled !== false)
       .map((nfz, index) =>
         planningNfzToMissionNfz(nfz.label || `NFZ_${index + 1}`, nfz.polygon, simTimeS),
       );
-    const nextPlan = generateMissionPlanFromArea(config, area.polygon, base, enabledNfzs);
-    nextPlan.lossResponseMode =
-      config.commsPolicy === "full_signal" ? lossResponseMode : "dispatch_replacement";
-    nextPlan.events.push({
-      id: `EVT_${String(nextPlan.events.length + 1).padStart(3, "0")}_NFZ_DISABLED`,
-      timeS: simTimeS,
-      severity: "info",
-      text: `${target.label} disabled; routes recalculated against remaining active NFZs`,
-    });
-    setPlan(nextPlan);
+    setPlan(
+      applyNfzSetUpdate(
+        plan,
+        activeNfzs,
+        simTimeS,
+        selectedUavId,
+        `${target.label} ${enabling ? "enabled" : "disabled"}`,
+      ),
+    );
   };
 
   const toggleSelectedBaseAvailability = () => {
@@ -647,11 +635,11 @@ export function OmniVisApp() {
         ),
       );
     } else if (kind === "nfz") {
-      setPlanningNfzs((current) =>
-        current.map((nfz) =>
-          nfz.id === id ? { ...nfz, polygon: shiftPolygon(nfz.polygon, delta, vertexIndex) } : nfz,
-        ),
+      const nextPlanningNfzs = planningNfzsRef.current.map((nfz) =>
+        nfz.id === id ? { ...nfz, polygon: shiftPolygon(nfz.polygon, delta, vertexIndex) } : nfz,
       );
+      planningNfzsRef.current = nextPlanningNfzs;
+      setPlanningNfzs(nextPlanningNfzs);
     } else if (kind === "base") {
       setHomeBases((current) =>
         current.map((base) =>
@@ -680,7 +668,38 @@ export function OmniVisApp() {
         }),
       );
     }
-    setPlan(null);
+    if (kind !== "nfz") {
+      setPlan(null);
+    }
+  };
+
+  const handleCommitEditorFeatureMove = (
+    kind: EditorFeatureKind,
+    id: string,
+    delta?: Point,
+    vertexIndex?: number,
+  ) => {
+    if (kind !== "nfz") return;
+    if (delta && Math.hypot(delta.x, delta.y) > 0.1) {
+      handleMoveEditorFeature(kind, id, delta, vertexIndex);
+    }
+    if (!plan) return;
+    const target = planningNfzsRef.current.find((nfz) => nfz.id === id);
+    if (!target || target.enabled === false) return;
+    const activeNfzs = planningNfzsRef.current
+      .filter((nfz) => nfz.enabled !== false)
+      .map((nfz, index) =>
+        planningNfzToMissionNfz(nfz.label || `NFZ_${index + 1}`, nfz.polygon, simTimeS),
+      );
+    setPlan(
+      applyNfzSetUpdate(
+        plan,
+        activeNfzs,
+        simTimeS,
+        selectedUavId,
+        `${target.label} moved/resized`,
+      ),
+    );
   };
 
   const triggerLoss = () => {
@@ -763,7 +782,6 @@ export function OmniVisApp() {
             setDraftPolygon([]);
             setEditorMode("select");
           }}
-          onDeleteSelected={deleteSelected}
           onLinkBaseToArea={linkBaseToArea}
           onLinkBackupBaseToArea={linkBackupBaseToArea}
           onRenameArea={renameArea}
@@ -803,6 +821,7 @@ export function OmniVisApp() {
             onMapPoint={handleMapPoint}
             onSelectEditorFeature={handleSelectEditorFeature}
             onMoveEditorFeature={handleMoveEditorFeature}
+            onCommitEditorFeatureMove={handleCommitEditorFeatureMove}
           />
         </div>
         <aside className="flex min-h-0 flex-col gap-3 overflow-y-auto border-l border-white/10 bg-black p-3">

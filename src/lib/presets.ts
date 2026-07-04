@@ -94,6 +94,8 @@ export const DEFAULT_CONFIG: MissionConfig = {
   overlapRatio: 0.15,
   speedMps: 22,
   enduranceMin: 55,
+  batteryReserveMin: 8,
+  rechargeDurationMin: 10,
   minSeparationM: 250,
   altitudeLayerStartM: 120,
   altitudeLayerSpacingM: 30,

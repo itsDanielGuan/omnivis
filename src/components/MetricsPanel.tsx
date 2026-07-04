@@ -2,6 +2,7 @@
 
 import {
   Activity,
+  BatteryCharging,
   Clock,
   Gauge,
   Plane,
@@ -68,16 +69,21 @@ function uavStatusTone(uav: UavPlan, simTimeS: number) {
   return uav.status === "lost" ? "#ef4444" : uav.color;
 }
 
-function UavStatusTimeline({ uav }: { uav: UavPlan }) {
+function UavStatusTimeline({ uav, simTimeS }: { uav: UavPlan; simTimeS: number }) {
   const routeEndS = Math.max(1, uav.originalRoute?.at(-1)?.t ?? uav.route.at(-1)?.t ?? 1);
   const communicationLostAtS = uav.communicationLostAtS;
   const lossDetectedAtS = uav.lossDetectedAtS ?? uav.lostAtS;
+  const currentPct = clampPct((simTimeS / routeEndS) * 100);
 
   if (communicationLostAtS === undefined || lossDetectedAtS === undefined) {
     return (
       <div className="mt-1">
-        <div className="h-1.5 w-full bg-sky-500" />
-        <div className="mt-1 font-mono text-[10px] uppercase text-neutral-600">Nominal 100%</div>
+        <div className="h-1.5 w-full overflow-hidden bg-neutral-800">
+          <span className="block h-full bg-sky-500" style={{ width: `${currentPct}%` }} />
+        </div>
+        <div className="mt-1 font-mono text-[10px] uppercase text-neutral-600">
+          Status {currentPct.toFixed(0)}%
+        </div>
       </div>
     );
   }
@@ -86,23 +92,85 @@ function UavStatusTimeline({ uav }: { uav: UavPlan }) {
   const detectedPct = clampPct((lossDetectedAtS / routeEndS) * 100);
   const communicationPct = Math.max(0, detectedPct - nominalPct);
   const lostPct = Math.max(0, 100 - detectedPct);
+  const nominalFillPct = Math.min(currentPct, nominalPct);
+  const communicationFillPct = Math.min(Math.max(currentPct - nominalPct, 0), communicationPct);
+  const lostFillPct = Math.min(Math.max(currentPct - detectedPct, 0), lostPct);
 
   return (
     <div className="mt-1">
       <div
-        className="flex h-1.5 w-full overflow-hidden bg-neutral-900"
+        className="flex h-1.5 w-full overflow-hidden bg-neutral-800"
         title={`Nominal ${nominalPct.toFixed(0)}%, communication loss ${communicationPct.toFixed(0)}%, drone loss ${lostPct.toFixed(0)}%`}
       >
-        {nominalPct > 0 ? <span className="bg-sky-500" style={{ width: `${nominalPct}%` }} /> : null}
-        {communicationPct > 0 ? (
-          <span className="bg-amber-500" style={{ width: `${communicationPct}%` }} />
+        {nominalFillPct > 0 ? (
+          <span className="bg-sky-500" style={{ width: `${nominalFillPct}%` }} />
         ) : null}
-        {lostPct > 0 ? <span className="bg-red-500" style={{ width: `${lostPct}%` }} /> : null}
+        {communicationFillPct > 0 ? (
+          <span className="bg-amber-500" style={{ width: `${communicationFillPct}%` }} />
+        ) : null}
+        {lostFillPct > 0 ? (
+          <span className="bg-red-500" style={{ width: `${lostFillPct}%` }} />
+        ) : null}
       </div>
       <div className="mt-1 flex items-center gap-2 font-mono text-[10px] uppercase text-neutral-600">
-        <span>Nom {nominalPct.toFixed(0)}%</span>
-        <span>Comms {communicationPct.toFixed(0)}%</span>
-        <span>Lost {lostPct.toFixed(0)}%</span>
+        <span>Nom {nominalFillPct.toFixed(0)}%</span>
+        <span>Comms {communicationFillPct.toFixed(0)}%</span>
+        <span>Lost {lostFillPct.toFixed(0)}%</span>
+      </div>
+    </div>
+  );
+}
+
+function batteryState(uav: UavPlan, plan: MissionPlan, simTimeS: number) {
+  const route = uav.route;
+  const routeEndS = route.at(-1)?.t ?? simTimeS;
+  const boundedTimeS = Math.max(route[0]?.t ?? 0, Math.min(simTimeS, routeEndS));
+  const enduranceS = Math.max(60, plan.config.enduranceMin * 60);
+  const reservePct = clampPct((plan.config.batteryReserveMin / plan.config.enduranceMin) * 100);
+  const rechargeIndex = route.findIndex((point, index) => {
+    const previous = route[index - 1];
+    return point.phase === "recharge" && previous && boundedTimeS >= previous.t && boundedTimeS < point.t;
+  });
+
+  if (rechargeIndex > 0) {
+    const rechargeEnd = route[rechargeIndex];
+    const rechargeStart = route[rechargeIndex - 1];
+    const rechargeProgress =
+      (boundedTimeS - rechargeStart.t) / Math.max(1, rechargeEnd.t - rechargeStart.t);
+    return {
+      pct: clampPct(reservePct + rechargeProgress * (100 - reservePct)),
+      label: "Charging",
+      colorClass: "bg-emerald-400",
+    };
+  }
+
+  const sortieStartS =
+    [...route]
+      .reverse()
+      .find(
+        (point) =>
+          point.t <= boundedTimeS && (point.phase === "preflight" || point.phase === "recharge"),
+      )?.t ?? route[0]?.t ?? 0;
+  const pct = clampPct(100 - ((boundedTimeS - sortieStartS) / enduranceS) * 100);
+  const colorClass =
+    pct <= reservePct + 5 ? "bg-red-500" : pct <= reservePct + 20 ? "bg-amber-500" : "bg-emerald-400";
+  return {
+    pct,
+    label: `${Math.round(pct)}%`,
+    colorClass,
+  };
+}
+
+function BatteryBar({ uav, plan, simTimeS }: { uav: UavPlan; plan: MissionPlan; simTimeS: number }) {
+  const battery = batteryState(uav, plan, simTimeS);
+  return (
+    <div className="mt-1">
+      <div className="flex items-center justify-between font-mono text-[10px] uppercase text-neutral-600">
+        <span>Battery</span>
+        <span>{battery.label}</span>
+      </div>
+      <div className="mt-0.5 h-1.5 w-full overflow-hidden bg-neutral-800">
+        <span className={`block h-full ${battery.colorClass}`} style={{ width: `${battery.pct}%` }} />
       </div>
     </div>
   );
@@ -161,7 +229,27 @@ export function MetricsPanel({ plan, simTimeS, selectedUavId, onSelectUav }: Pro
           tone="success"
           Icon={ShieldCheck}
         />
+        <MetricCard
+          label="Recharge"
+          value={`${metrics.rechargeCycleCount}`}
+          tone={metrics.enduranceWarningCount > 0 ? "warning" : "success"}
+          Icon={BatteryCharging}
+        />
+        <MetricCard
+          label="Forced RTB"
+          value={`${metrics.forcedRtbCount}`}
+          tone={metrics.forcedRtbCount > 0 ? "warning" : "success"}
+          Icon={TriangleAlert}
+        />
       </div>
+
+      {metrics.enduranceWarningCount > 0 || metrics.coverageDebtStripCount > 0 ? (
+        <div className="border border-amber-300/25 bg-amber-400/10 p-3 text-xs text-amber-100">
+          {metrics.enduranceWarningCount > 0
+            ? `${metrics.enduranceWarningCount} UAV route warning${metrics.enduranceWarningCount === 1 ? "" : "s"}: at least one strip cannot fit inside a fresh sortie plus RTB reserve.`
+            : "Coverage debt remains after contingency replanning."}
+        </div>
+      ) : null}
 
       {metrics.before ? (
         <div className="border border-white/10 bg-black p-3">
@@ -219,7 +307,14 @@ export function MetricsPanel({ plan, simTimeS, selectedUavId, onSelectUav }: Pro
                   <span className="block truncate text-xs text-neutral-500">
                     {getCurrentTask(uav, simTimeS)}
                   </span>
-                  <UavStatusTimeline uav={uav} />
+                  {uav.rechargeCount || uav.forcedRtbCount || uav.enduranceWarning ? (
+                    <span className="mt-0.5 block truncate text-[11px] text-amber-300/90">
+                      {uav.enduranceWarning ??
+                        `${uav.rechargeCount ?? 0} recharge / ${uav.forcedRtbCount ?? 0} reserve RTB`}
+                    </span>
+                  ) : null}
+                  <UavStatusTimeline uav={uav} simTimeS={simTimeS} />
+                  <BatteryBar uav={uav} plan={plan} simTimeS={simTimeS} />
                 </span>
                 <span className="text-right font-mono text-xs text-neutral-300">
                   {Math.round(snapshot.progressPct)}%
