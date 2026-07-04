@@ -118,6 +118,10 @@ function buildReadme(plan: MissionPlan): MissionArtifact {
 }
 
 export function buildMissionArtifacts(plan: MissionPlan): MissionArtifact[] {
+  const initialInfill =
+    plan.config.initialInfillPattern ?? plan.config.pathPattern ?? "rectilinear";
+  const contingencyInfill =
+    plan.config.contingencyInfillPattern ?? initialInfill;
   const missionContract = {
     schema: "omnivis.mission_contract.v1",
     missionId: plan.id,
@@ -141,6 +145,10 @@ export function buildMissionArtifacts(plan: MissionPlan): MissionArtifact[] {
     },
     aooPolygonM: plan.aoo,
     config: plan.config,
+    infill: {
+      initial: initialInfill,
+      contingency: contingencyInfill,
+    },
     uavs: plan.uavs.map((uav) => ({
       id: uav.id,
       label: uav.label,
@@ -165,11 +173,8 @@ export function buildMissionArtifacts(plan: MissionPlan): MissionArtifact[] {
     vehicleLoss: {
       activeMode: plan.lossResponseMode,
       dispatchReplacement:
-        "Silent operation redoes the lost UAV sector from base; full-signal operation continues from the last GPS point.",
-      spreadRemainingSwarm:
-        plan.config.pathPattern === "nearest_infill"
-          ? "In full-signal operation, unfinished strips use nearest-infill redistribution from active UAV current positions."
-          : "In full-signal operation, unfinished strips are redistributed as contiguous coverage zones.",
+        "Replacement UAVs launch from the active home or backup base and inherit unfinished work from the lost aircraft.",
+      spreadRemainingSwarm: `In full-signal operation, unfinished strips are redistributed using the ${contingencyInfill} contingency infill.`,
     },
     popUpNfz:
       "Live NFZ updates block intersecting strips and trigger NFZ-safe replans for affected future route legs.",

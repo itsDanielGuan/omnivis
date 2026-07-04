@@ -11,7 +11,12 @@ import { TacticalEventFeed } from "@/components/TacticalEventFeed";
 import { TimelineControls } from "@/components/TimelineControls";
 import { UnitCard } from "@/components/UnitCard";
 import { downloadMissionPackage } from "@/lib/exporters";
-import { getMissionMaxTime, generateMissionPlanFromArea, planningNfzToMissionNfz } from "@/lib/planner";
+import {
+  getMissionMaxTime,
+  generateMissionPlanFromArea,
+  normalizeInfillPattern,
+  planningNfzToMissionNfz,
+} from "@/lib/planner";
 import { DEFAULT_CONFIG, getMapPreset } from "@/lib/presets";
 import { normalizeHomeBase } from "@/lib/routing";
 import {
@@ -34,6 +39,7 @@ import type {
   PlanningArea,
   PlanningNfz,
   Point,
+  UavPlan,
 } from "@/lib/types";
 
 type PersistedPlanningState = {
@@ -117,6 +123,18 @@ function resolveAreaHomeBase(
   if (isHomeBaseAvailable(backup)) return backup;
   if (isHomeBaseAvailable(selectedBase)) return selectedBase;
   return homeBases.find(isHomeBaseAvailable) ?? primary ?? backup ?? selectedBase ?? homeBases[0];
+}
+
+function canArmCommunicationLoss(uav?: UavPlan) {
+  return Boolean(
+    uav &&
+      !uav.reserve &&
+      uav.status !== "lost" &&
+      uav.status !== "regained" &&
+      uav.communicationLostAtS === undefined &&
+      uav.lossDetectedAtS === undefined &&
+      uav.lostAtS === undefined,
+  );
 }
 
 function resolveFailoverBaseForOfflineBase(
@@ -233,6 +251,8 @@ export function OmniVisApp() {
     ? resolveAreaHomeBase(selectedArea, homeBases, selectedBase)
     : selectedBase;
   const canCompile = Boolean(selectedArea && compileBase);
+  const selectedUav = plan?.uavs.find((uav) => uav.id === selectedUavId);
+  const canTriggerSelectedLoss = canArmCommunicationLoss(selectedUav);
 
   const compileMission = useCallback(() => {
     const area = selectedArea ?? areas[0];
@@ -283,7 +303,13 @@ export function OmniVisApp() {
     const normalizedNext: MissionConfig = {
       ...next,
       commsPolicy: next.commsPolicy === "full_signal" ? "full_signal" : "silent_operation",
-      pathPattern: next.pathPattern ?? "sector_lanes",
+      initialInfillPattern: normalizeInfillPattern(
+        next.initialInfillPattern ?? next.pathPattern,
+      ),
+      contingencyInfillPattern: normalizeInfillPattern(
+        next.contingencyInfillPattern ?? next.initialInfillPattern ?? next.pathPattern,
+      ),
+      pathPattern: normalizeInfillPattern(next.initialInfillPattern ?? next.pathPattern),
       batteryReserveMin: Math.min(
         Math.max(1, next.batteryReserveMin ?? DEFAULT_CONFIG.batteryReserveMin),
         Math.max(1, next.enduranceMin - 1),
@@ -461,6 +487,16 @@ export function OmniVisApp() {
         if (area.id !== selectedAreaId || area.linkedBaseId === selectedBaseId) return area;
         return { ...area, backupBaseId: selectedBaseId };
       }),
+    );
+    setPlan(null);
+  };
+
+  const clearBackupBaseFromArea = () => {
+    if (!selectedAreaId) return;
+    setAreas((current) =>
+      current.map((area) =>
+        area.id === selectedAreaId ? { ...area, backupBaseId: undefined } : area,
+      ),
     );
     setPlan(null);
   };
@@ -706,6 +742,8 @@ export function OmniVisApp() {
     if (!plan) return;
     const failedId = selectedUavId ?? plan.uavs.find((uav) => !uav.reserve)?.id;
     if (!failedId) return;
+    const failed = plan.uavs.find((uav) => uav.id === failedId);
+    if (!canArmCommunicationLoss(failed)) return;
     setPlan(applyVehicleLoss(plan, failedId, lossResponseMode, simTimeS));
   };
 
@@ -760,7 +798,7 @@ export function OmniVisApp() {
           draftPointCount={draftPolygon.length}
           canCompile={canCompile}
           canDeleteSelected={Boolean(selectedAreaId || selectedBaseId || selectedNfzId)}
-          canTriggerSelectedLoss={Boolean(plan && selectedUavId)}
+          canTriggerSelectedLoss={canTriggerSelectedLoss}
           onConfigChange={handleConfigChange}
           onDemoModeChange={handleDemoModeChange}
           onEditorModeChange={handleEditorModeChange}
@@ -784,6 +822,7 @@ export function OmniVisApp() {
           }}
           onLinkBaseToArea={linkBaseToArea}
           onLinkBackupBaseToArea={linkBackupBaseToArea}
+          onClearBackupBaseFromArea={clearBackupBaseFromArea}
           onRenameArea={renameArea}
           onRenameBase={renameBase}
           onRenameNfz={renameNfz}

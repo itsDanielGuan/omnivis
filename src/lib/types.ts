@@ -21,10 +21,19 @@ export type DemoMode =
 
 export type CommsPolicy = "silent_operation" | "full_signal";
 
-export type PathPattern =
-  | "sector_lanes"
-  | "alternating_lanes"
-  | "nearest_infill";
+export type InfillPattern =
+  | "rectilinear"
+  | "zigzag"
+  | "grid"
+  | "triangles"
+  | "tri_hex"
+  | "diamond"
+  | "chevron"
+  | "crosshatch"
+  | "lattice"
+  | "lightning";
+
+export type PathPattern = InfillPattern;
 
 export type LossResponseMode =
   | "dispatch_replacement"
@@ -86,7 +95,9 @@ export type MissionConfig = {
   stripAngleDeg: number;
   rtbSlotSpacingS: number;
   commsPolicy: CommsPolicy;
-  pathPattern: PathPattern;
+  initialInfillPattern: InfillPattern;
+  contingencyInfillPattern: InfillPattern;
+  pathPattern?: InfillPattern;
   seed: number;
 };
 
@@ -146,6 +157,8 @@ export type CoverageStrip = {
   polygon: Point[];
   assignedUavId: string;
   status: StripStatus;
+  infillPattern?: InfillPattern;
+  infillPass?: number;
 };
 
 export type RouteWaypoint = Point & {

@@ -103,7 +103,8 @@ export const DEFAULT_CONFIG: MissionConfig = {
   stripAngleDeg: 15,
   rtbSlotSpacingS: 90,
   commsPolicy: "silent_operation",
-  pathPattern: "sector_lanes",
+  initialInfillPattern: "rectilinear",
+  contingencyInfillPattern: "zigzag",
   seed: 7429,
 };
 

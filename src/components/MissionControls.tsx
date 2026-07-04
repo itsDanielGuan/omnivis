@@ -27,9 +27,9 @@ import type {
   DemoMode,
   EditorMode,
   HomeBase,
+  InfillPattern,
   LossResponseMode,
   MissionConfig,
-  PathPattern,
   PlanningArea,
   PlanningNfz,
 } from "@/lib/types";
@@ -74,6 +74,7 @@ type Props = {
   onCancelDraft: () => void;
   onLinkBaseToArea: () => void;
   onLinkBackupBaseToArea: () => void;
+  onClearBackupBaseFromArea: () => void;
   onRenameArea: (areaId: string, label: string) => void;
   onRenameBase: (baseId: string, label: string) => void;
   onRenameNfz: (nfzId: string, label: string) => void;
@@ -134,26 +135,125 @@ function commandButton(active: boolean) {
     : "border-white/10 bg-neutral-900 text-neutral-100 hover:bg-neutral-800";
 }
 
+const INFILL_PATTERN_OPTIONS: Array<{
+  id: InfillPattern;
+  label: string;
+  shortLabel: string;
+  description: string;
+  contingency: string;
+  stroke: string;
+  routes: string[];
+}> = [
+  {
+    id: "rectilinear",
+    label: "Rectilinear",
+    shortLabel: "Lines",
+    description: "Parallel passes at the configured strip angle.",
+    contingency: "Keeps unfinished work in predictable lane blocks.",
+    stroke: "#38bdf8",
+    routes: ["M18 24 H118 M18 38 H118 M18 52 H118 M18 66 H118"],
+  },
+  {
+    id: "zigzag",
+    label: "Zigzag",
+    shortLabel: "Zigzag",
+    description: "Serpentine lane sequencing reduces long deadhead turns.",
+    contingency: "Useful when debt should be consumed as a continuous back-and-forth path.",
+    stroke: "#f59e0b",
+    routes: ["M18 24 H118 L18 38 H118 L18 52 H118 L18 66 H118"],
+  },
+  {
+    id: "grid",
+    label: "Grid",
+    shortLabel: "Grid",
+    description: "Two rectilinear passes at right angles form square cells.",
+    contingency: "Interleaves unfinished cells across the active swarm.",
+    stroke: "#22d3ee",
+    routes: ["M18 28 H118 M18 58 H118", "M42 16 V74 M88 16 V74"],
+  },
+  {
+    id: "triangles",
+    label: "Triangles",
+    shortLabel: "Tri",
+    description: "Three angled passes form a triangular truss pattern.",
+    contingency: "Greedy reassignment works well when geometry is highly interlocked.",
+    stroke: "#a78bfa",
+    routes: ["M18 66 H118", "M24 72 L68 18 L112 72", "M18 30 L62 74 L118 18"],
+  },
+  {
+    id: "tri_hex",
+    label: "Tri-hex",
+    shortLabel: "Tri-hex",
+    description: "Sparse three-axis passes suggest hex cells with triangular braces.",
+    contingency: "Balances strong mesh coverage with fewer contingency segments.",
+    stroke: "#34d399",
+    routes: ["M20 28 H116 M20 60 H116", "M30 74 L72 16 L116 74", "M18 18 L60 74 L112 18"],
+  },
+  {
+    id: "diamond",
+    label: "Diamond",
+    shortLabel: "Diamond",
+    description: "Opposed diagonal passes create a faceted diamond mesh.",
+    contingency: "Good when recovery should expand out from the centerline.",
+    stroke: "#fb7185",
+    routes: ["M20 70 L68 18 L116 70", "M20 18 L68 70 L116 18"],
+  },
+  {
+    id: "chevron",
+    label: "Chevron",
+    shortLabel: "Chevron",
+    description: "Alternating slanted passes form sharp V-shaped coverage.",
+    contingency: "Closes damaged boundaries before working back through the middle.",
+    stroke: "#60a5fa",
+    routes: ["M20 64 L48 24 L76 64 L104 24", "M32 74 L60 34 L88 74 L116 34"],
+  },
+  {
+    id: "crosshatch",
+    label: "Crosshatch",
+    shortLabel: "Hatch",
+    description: "Grid passes get a lighter diagonal brace pass.",
+    contingency: "Shares work round-robin while preserving multiple approach axes.",
+    stroke: "#f472b6",
+    routes: ["M18 32 H118 M18 58 H118", "M42 18 V74 M92 18 V74", "M20 72 L118 20"],
+  },
+  {
+    id: "lattice",
+    label: "Lattice",
+    shortLabel: "Lattice",
+    description: "A denser multi-axis truss for highly cooperative coverage.",
+    contingency: "Interleaves active UAVs through a robust mesh of remaining work.",
+    stroke: "#2dd4bf",
+    routes: ["M18 24 H118 M18 64 H118", "M26 74 L70 16 L118 72", "M18 18 L62 74 L116 22"],
+  },
+  {
+    id: "lightning",
+    label: "Lightning",
+    shortLabel: "Bolt",
+    description: "Sparse angular passes prioritize fast opportunistic infill.",
+    contingency: "Greedy nearest-work absorption favors quick local recovery.",
+    stroke: "#fde047",
+    routes: ["M18 70 L38 28 L56 54 L82 20 L98 62 L118 34"],
+  },
+];
+
+function infillOption(pattern: InfillPattern) {
+  return INFILL_PATTERN_OPTIONS.find((option) => option.id === pattern) ?? INFILL_PATTERN_OPTIONS[0];
+}
+
 function CoveragePathGraphic({
   pattern,
   compact = false,
 }: {
-  pattern: PathPattern;
+  pattern: InfillPattern;
   compact?: boolean;
 }) {
-  const stroke = pattern === "nearest_infill" ? "#34d399" : pattern === "alternating_lanes" ? "#f59e0b" : "#38bdf8";
-  const d =
-    pattern === "nearest_infill"
-      ? "M18 70 L35 28 L57 56 L78 24 L96 64 L118 34"
-      : pattern === "alternating_lanes"
-        ? "M18 24 H118 M118 38 H18 M18 52 H118 M118 66 H18"
-        : "M18 24 H118 M18 38 H118 M18 52 H118 M18 66 H118";
+  const option = infillOption(pattern);
   return (
     <svg
       className={compact ? "h-16 w-full" : "h-20 w-full"}
       viewBox="0 0 136 88"
       role="img"
-      aria-label={`${pattern.replaceAll("_", " ")} coverage path preview`}
+      aria-label={`${option.label} coverage path preview`}
     >
       <path
         d="M12 18 L122 14 L128 74 L20 78 Z"
@@ -170,24 +270,26 @@ function CoveragePathGraphic({
           strokeWidth="1"
         />
       ))}
-      <path
-        d={d}
-        fill="none"
-        stroke={stroke}
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth="4"
-      />
+      {option.routes.map((route, index) => (
+        <path
+          key={route}
+          d={route}
+          fill="none"
+          stroke={option.stroke}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeOpacity={index === 0 ? 1 : 0.62}
+          strokeWidth={index === 0 ? 4 : 3}
+        />
+      ))}
       <circle cx="15" cy="74" r="4" fill="#e5e5e5" />
       <path d="M15 74 L24 66" stroke="rgba(229,229,229,0.8)" strokeWidth="1.5" />
     </svg>
   );
 }
 
-function coveragePathLabel(pattern: PathPattern) {
-  if (pattern === "nearest_infill") return "Nearest infill";
-  if (pattern === "alternating_lanes") return "Alternating lanes";
-  return "Sector lanes";
+function infillLabel(pattern: InfillPattern) {
+  return infillOption(pattern).label;
 }
 
 export function MissionControls({
@@ -213,6 +315,7 @@ export function MissionControls({
   onCancelDraft,
   onLinkBaseToArea,
   onLinkBackupBaseToArea,
+  onClearBackupBaseFromArea,
   onRenameArea,
   onRenameBase,
   onRenameNfz,
@@ -247,7 +350,13 @@ export function MissionControls({
   const operationMode: CommsPolicy =
     config.commsPolicy === "full_signal" ? "full_signal" : "silent_operation";
   const spreadAvailable = operationMode === "full_signal";
-  const pathPattern = config.pathPattern ?? "sector_lanes";
+  const initialInfillPattern = config.initialInfillPattern ?? config.pathPattern ?? "rectilinear";
+  const contingencyInfillPattern =
+    config.contingencyInfillPattern ?? initialInfillPattern;
+  const initialInfillOption = infillOption(initialInfillPattern);
+  const contingencyInfillOption = infillOption(contingencyInfillPattern);
+  const spreadUsesContingency =
+    spreadAvailable && lossResponseMode === "spread_remaining_swarm";
   const [actionMenu, setActionMenu] = useState<ActionMenu>(null);
   const [pendingDelete, setPendingDelete] = useState<PendingDelete>(null);
 
@@ -701,6 +810,14 @@ export function MissionControls({
             {selectedBase?.available === false ? "Restore Base" : "Mark Offline"}
           </button>
         </div>
+        <button
+          className="mt-2 inline-flex w-full items-center justify-center gap-2 border border-white/10 bg-black px-2 py-2 text-xs font-semibold text-neutral-300 transition hover:border-white/25 hover:bg-neutral-900 disabled:cursor-not-allowed disabled:opacity-35"
+          disabled={!selectedArea?.backupBaseId}
+          onClick={onClearBackupBaseFromArea}
+        >
+          <X className="size-3.5" />
+          Remove backup from selected area
+        </button>
         <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
           <div
             className={`border p-2 ${
@@ -999,64 +1116,115 @@ export function MissionControls({
           <option value="silent_operation">Silent operation</option>
           <option value="full_signal">Full signal + GPS</option>
         </select>
-        <label className="mb-3 block text-xs text-neutral-400">
-          <span className="flex items-center justify-between gap-2">
-            <span>Coverage path</span>
+        <div className="mb-3 text-xs text-neutral-400">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <span>Initial infill</span>
             <span className="group relative inline-flex">
               <Info className="size-3.5 text-neutral-500" />
-              <span className="pointer-events-none absolute right-0 top-5 z-30 hidden w-72 border border-white/10 bg-black p-2 shadow-2xl group-hover:block group-focus-within:block">
-                <span className="grid grid-cols-3 gap-2">
-                  {(["sector_lanes", "alternating_lanes", "nearest_infill"] as PathPattern[]).map(
-                    (candidate) => (
-                      <span
-                        key={candidate}
-                        className={`border p-1 ${
-                          candidate === pathPattern
-                            ? "border-white/30 bg-white/10"
-                            : "border-white/10 bg-neutral-950"
-                        }`}
-                      >
-                        <CoveragePathGraphic pattern={candidate} compact />
-                        <span className="block truncate text-center font-mono text-[9px] uppercase text-neutral-400">
-                          {coveragePathLabel(candidate)}
-                        </span>
+              <span className="pointer-events-none absolute right-0 top-5 z-30 hidden w-80 border border-white/10 bg-black p-2 shadow-2xl group-hover:block group-focus-within:block">
+                <span className="grid grid-cols-2 gap-2">
+                  {INFILL_PATTERN_OPTIONS.map((candidate) => (
+                    <span
+                      key={candidate.id}
+                      className={`border p-1 ${
+                        candidate.id === initialInfillPattern
+                          ? "border-white/30 bg-white/10"
+                          : "border-white/10 bg-neutral-950"
+                      }`}
+                    >
+                      <CoveragePathGraphic pattern={candidate.id} compact />
+                      <span className="block text-center font-mono text-[9px] uppercase text-neutral-300">
+                        {candidate.shortLabel}
                       </span>
-                    ),
-                  )}
+                    </span>
+                  ))}
                 </span>
               </span>
             </span>
-          </span>
-          <select
-            className="mt-1 w-full border border-white/10 bg-black px-2 py-2 text-sm text-neutral-100 outline-none focus:border-white/30"
-            value={pathPattern}
-            onChange={(event) =>
-              onConfigChange({
-                ...config,
-                pathPattern: event.target.value as PathPattern,
-              })
-            }
-          >
-            <option value="sector_lanes">Sector lanes</option>
-            <option value="alternating_lanes">Alternating lanes</option>
-            <option value="nearest_infill">Nearest infill</option>
-          </select>
-        </label>
+          </div>
+          <div className="grid grid-cols-2 gap-1.5">
+            {INFILL_PATTERN_OPTIONS.map((candidate) => (
+              <button
+                key={candidate.id}
+                type="button"
+                className={`border px-2 py-1.5 text-left text-[11px] font-semibold transition ${
+                  candidate.id === initialInfillPattern
+                    ? "border-white/30 bg-neutral-200 text-black"
+                    : "border-white/10 bg-black text-neutral-300 hover:bg-neutral-900"
+                }`}
+                onClick={() =>
+                  onConfigChange({
+                    ...config,
+                    initialInfillPattern: candidate.id,
+                    pathPattern: candidate.id,
+                  })
+                }
+              >
+                {candidate.shortLabel}
+              </button>
+            ))}
+          </div>
+          <div className="mt-2 text-[11px] leading-4 text-neutral-500">
+            Generates the compiled coverage geometry before launch.
+          </div>
+        </div>
         <div className="mb-3 border border-white/10 bg-black p-2">
           <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wide text-neutral-500">
-            <span>{coveragePathLabel(pathPattern)}</span>
-            <span>Preview</span>
+            <span>{infillLabel(initialInfillPattern)}</span>
+            <span>Compile preview</span>
           </div>
-          <CoveragePathGraphic pattern={pathPattern} />
+          <CoveragePathGraphic pattern={initialInfillPattern} />
+          <div className="mt-1 text-[11px] leading-4 text-neutral-400">
+            {initialInfillOption.description}
+          </div>
+        </div>
+        <div className="mb-3 text-xs text-neutral-400">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <span>Contingency infill</span>
+            <span className="font-mono text-[10px] uppercase tracking-wide text-neutral-600">
+              Future work
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-1.5">
+            {INFILL_PATTERN_OPTIONS.map((candidate) => (
+              <button
+                key={candidate.id}
+                type="button"
+                className={`border px-2 py-1.5 text-left text-[11px] font-semibold transition ${
+                  candidate.id === contingencyInfillPattern
+                    ? "border-white/30 bg-neutral-200 text-black"
+                    : "border-white/10 bg-black text-neutral-300 hover:bg-neutral-900"
+                }`}
+                onClick={() =>
+                  onConfigChange({ ...config, contingencyInfillPattern: candidate.id })
+                }
+              >
+                {candidate.shortLabel}
+              </button>
+            ))}
+          </div>
+          <div className="mt-2 text-[11px] leading-4 text-neutral-500">
+            Re-sequences replacement, spread, and NFZ-safe future branches without reviving completed or blocked strips.
+          </div>
+        </div>
+        <div className="mb-3 border border-white/10 bg-black p-2">
+          <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wide text-neutral-500">
+            <span>{infillLabel(contingencyInfillPattern)}</span>
+            <span>Contingency preview</span>
+          </div>
+          <CoveragePathGraphic pattern={contingencyInfillPattern} />
+          <div className="mt-1 text-[11px] leading-4 text-neutral-400">
+            {contingencyInfillOption.contingency}
+          </div>
         </div>
         <div className="mb-3 border border-white/10 bg-black p-2 text-xs text-neutral-400">
           {operationMode === "full_signal"
-            ? "GPS is available: replacement can continue from the loss point, or active UAVs can spread remaining work."
+            ? "Full Signal: choose Replacement or Spread. Spread can reassign live unfinished coverage."
             : "Silent operation: only alive/health signals are assumed, so a loss redoes the assigned sector from base."}
           <span className="mt-1 block text-neutral-500">
-            {pathPattern === "nearest_infill"
-              ? "Spread uses nearest-strip infill from current positions."
-              : "Spread keeps contiguous coverage zones like the default compile."}
+            {spreadUsesContingency
+              ? contingencyInfillOption.contingency
+              : `Replacement launches from the active base and uses ${infillLabel(contingencyInfillPattern)} for inherited work.`}
           </span>
         </div>
         <div className="grid grid-cols-2 gap-2">

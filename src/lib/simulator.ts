@@ -12,7 +12,11 @@ import {
 } from "@/lib/geometry";
 import { computeMissionMetrics } from "@/lib/metrics";
 import { UAV_COLORS } from "@/lib/presets";
-import { buildRouteFromStart, generateMissionPlanFromArea } from "@/lib/planner";
+import {
+  buildRouteFromStart,
+  contingencyInfillPattern,
+  generateMissionPlanFromArea,
+} from "@/lib/planner";
 import {
   buildReturnRouteViaBaseWaypoint,
   normalizeHomeBase,
@@ -28,6 +32,7 @@ import type {
   MissionMessage,
   MissionPlan,
   Nfz,
+  InfillPattern,
   Point,
   RouteWaypoint,
   UavPlan,
@@ -129,7 +134,7 @@ function pendingAssignedStrips(
 ): CoverageStrip[] {
   return plan.strips.filter((strip) => {
     if (strip.assignedUavId !== uav.id) return false;
-    if (strip.status === "blocked_by_nfz") return false;
+    if (strip.status === "blocked_by_nfz" || strip.status === "completed") return false;
     return stripCompletionTime(uav.route, strip.id) > timeS;
   });
 }
@@ -209,6 +214,7 @@ function buildContinuationForUav(
   strips: CoverageStrip[],
   startTimeS: number,
   uavIndex: number,
+  pattern: InfillPattern = contingencyInfillPattern(plan.config),
 ) {
   const current = interpolateRoute(uav.route, startTimeS);
   const prefix = [
@@ -246,6 +252,7 @@ function buildContinuationForUav(
     uavIndex,
     false,
     plan.nfzs,
+    pattern,
   );
   uav.originalRoute = uav.originalRoute ?? uav.route;
   uav.route = [...prefix, ...egressRoute, ...build.route.slice(1)];
@@ -258,9 +265,68 @@ function buildContinuationForUav(
     if (strip) strip.status = "coverage_debt";
   });
   uav.assignedStripIds = plan.strips
-    .filter((strip) => strip.assignedUavId === uav.id && strip.status !== "coverage_debt")
+    .filter(
+      (strip) =>
+        strip.assignedUavId === uav.id &&
+        strip.status !== "coverage_debt" &&
+        strip.status !== "blocked_by_nfz" &&
+        strip.status !== "completed",
+    )
     .map((strip) => strip.id);
   recomputeUavUtilization(uav);
+}
+
+function buildCommunicationRecoveryRoute(
+  plan: MissionPlan,
+  uav: UavPlan,
+  start: Point,
+  startTimeS: number,
+  lossDetectedAtS: number,
+  uavIndex: number,
+): { route: RouteWaypoint[]; lossPoint: RouteWaypoint } {
+  const returnRoute = buildReturnRouteViaBaseWaypoint({
+    start,
+    startTimeS,
+    base: plan.homeBase,
+    config: plan.config,
+    nfzs: plan.nfzs,
+    uavIndex,
+  }).map((point, index) => ({
+    ...point,
+    phase: index === 0 ? ("return" as const) : point.phase,
+    label:
+      index === 0
+        ? "communication lost; returning toward launch base"
+        : point.label,
+  }));
+  const prefix = routeAtOrBefore(uav.route, startTimeS);
+  const returnUntilLoss = routeAtOrBefore(returnRoute, lossDetectedAtS);
+  const prefixLast = prefix[prefix.length - 1];
+  const stitchedReturn =
+    prefixLast &&
+    returnUntilLoss[0] &&
+    distance(prefixLast, returnUntilLoss[0]) < 1 &&
+    Math.abs(prefixLast.t - returnUntilLoss[0].t) < 0.1
+      ? returnUntilLoss.slice(1)
+      : returnUntilLoss;
+  const lossPoint = {
+    ...interpolateRoute(returnRoute, lossDetectedAtS),
+    t: lossDetectedAtS,
+    phase: "lost" as const,
+    label: "lost contact after communication recovery window",
+  };
+
+  return {
+    route: [
+      ...prefix,
+      ...stitchedReturn,
+      {
+        ...lossPoint,
+        t: lossDetectedAtS + 1,
+      },
+    ],
+    lossPoint,
+  };
 }
 
 function stripTraverseFrom(cursor: Point, strip: CoverageStrip, plan: MissionPlan, uavIndex: number) {
@@ -283,7 +349,7 @@ function unfinishedRedistributionStrips(
 ): CoverageStrip[] {
   return plan.strips
     .filter((strip) => {
-      if (strip.status === "blocked_by_nfz") return false;
+      if (strip.status === "blocked_by_nfz" || strip.status === "completed") return false;
       const sourceOwner = sourcePlan.uavs.find((uav) => uav.id === strip.assignedUavId);
       if (!sourceOwner) return strip.status === "coverage_debt";
       return stripCompletionTime(sourceOwner.originalRoute ?? sourceOwner.route, strip.id) > timeS;
@@ -386,6 +452,60 @@ function redistributeRemainingStripsBySector(
   return buckets;
 }
 
+function redistributeRemainingStripsInterleaved(
+  plan: MissionPlan,
+  sourcePlan: MissionPlan,
+  activeUavs: UavPlan[],
+  timeS: number,
+): Map<string, CoverageStrip[]> {
+  if (activeUavs.length === 0) return new Map();
+
+  const remaining = unfinishedRedistributionStrips(plan, sourcePlan, timeS);
+  const buckets = new Map<string, CoverageStrip[]>(
+    activeUavs.map((uav) => [uav.id, []]),
+  );
+
+  remaining.forEach((strip, index) => {
+    const owner = activeUavs[index % activeUavs.length];
+    const mutableStrip = plan.strips.find((candidate) => candidate.id === strip.id);
+    if (!owner || !mutableStrip) return;
+    mutableStrip.status = "planned";
+    mutableStrip.assignedUavId = owner.id;
+    buckets.get(owner.id)?.push(mutableStrip);
+  });
+
+  return buckets;
+}
+
+function redistributeRemainingStripsForPattern(
+  plan: MissionPlan,
+  sourcePlan: MissionPlan,
+  activeUavs: UavPlan[],
+  timeS: number,
+  pattern: InfillPattern,
+): Map<string, CoverageStrip[]> {
+  if (pattern === "lightning" || pattern === "triangles" || pattern === "tri_hex") {
+    return redistributeRemainingStripsGreedy(plan, sourcePlan, activeUavs, timeS);
+  }
+  if (pattern === "grid" || pattern === "crosshatch" || pattern === "lattice") {
+    return redistributeRemainingStripsInterleaved(plan, sourcePlan, activeUavs, timeS);
+  }
+  return redistributeRemainingStripsBySector(plan, sourcePlan, activeUavs, timeS);
+}
+
+function infillPatternSummary(pattern: InfillPattern) {
+  if (pattern === "zigzag") return "zigzag infill";
+  if (pattern === "grid") return "grid infill";
+  if (pattern === "triangles") return "triangle infill";
+  if (pattern === "tri_hex") return "tri-hex infill";
+  if (pattern === "diamond") return "diamond infill";
+  if (pattern === "chevron") return "chevron infill";
+  if (pattern === "crosshatch") return "crosshatch infill";
+  if (pattern === "lattice") return "lattice infill";
+  if (pattern === "lightning") return "lightning infill";
+  return "rectilinear infill";
+}
+
 export function getUavSnapshot(
   uav: UavPlan,
   timeS: number,
@@ -418,7 +538,7 @@ export function getCurrentTask(uav: UavPlan, timeS: number): string {
       timeS >= communicationLostAtS &&
       timeS < lossDetectedAtS
     ) {
-      return "Communication lost; holding original path";
+      return "Communication lost; returning toward launch base";
     }
     if (lossDetectedAtS === undefined || timeS >= lossDetectedAtS) return "Lost contact";
   }
@@ -438,6 +558,22 @@ export function applyVehicleLoss(
   mode: LossResponseMode,
   requestedTimeS: number,
 ): MissionPlan {
+  const sourceFailed =
+    sourcePlan.uavs.find((uav) => uav.id === failedUavId) ??
+    sourcePlan.uavs[2] ??
+    sourcePlan.uavs[0];
+  if (
+    !sourceFailed ||
+    sourceFailed.reserve ||
+    sourceFailed.status === "lost" ||
+    sourceFailed.status === "regained" ||
+    sourceFailed.communicationLostAtS !== undefined ||
+    sourceFailed.lossDetectedAtS !== undefined ||
+    sourceFailed.lostAtS !== undefined
+  ) {
+    return sourcePlan;
+  }
+
   const plan = clonePlan(sourcePlan);
   const fullSignal = isFullSignal(plan);
   const effectiveMode: LossResponseMode = fullSignal ? mode : "dispatch_replacement";
@@ -450,7 +586,7 @@ export function applyVehicleLoss(
   plan.lossResponseMode = effectiveMode;
   plan.activeContingency = "vehicle_loss";
 
-  const failed = plan.uavs.find((uav) => uav.id === failedUavId) ?? plan.uavs[2] ?? plan.uavs[0];
+  const failed = plan.uavs.find((uav) => uav.id === sourceFailed.id) ?? plan.uavs[0];
   const routeEndS = failed.route.at(-1)?.t ?? 900;
   const communicationLostAtS = Math.max(90, Math.min(requestedTimeS, routeEndS * 0.72));
   const lossDetectedAtS = Math.min(
@@ -458,25 +594,29 @@ export function applyVehicleLoss(
     communicationLostAtS + COMMUNICATION_LOSS_PERIOD_S,
   );
   const failedIndex = plan.uavs.findIndex((uav) => uav.id === failed.id);
-  const currentFailed = interpolateRoute(failed.route, lossDetectedAtS);
+  const communicationLossPoint = interpolateRoute(failed.route, communicationLostAtS);
+  const recoveryRoute = buildCommunicationRecoveryRoute(
+    plan,
+    failed,
+    communicationLossPoint,
+    communicationLostAtS,
+    lossDetectedAtS,
+    Math.max(0, failedIndex),
+  );
   failed.originalRoute = failed.originalRoute ?? failed.route;
-  failed.route = [
-    ...routeAtOrBefore(failed.route, lossDetectedAtS),
-    { ...currentFailed, t: lossDetectedAtS + 1, phase: "lost", label: "lost contact" },
-  ];
+  failed.route = recoveryRoute.route;
   failed.status = "lost";
   failed.communicationLostAtS = communicationLostAtS;
   failed.lossDetectedAtS = lossDetectedAtS;
   failed.lostAtS = lossDetectedAtS;
-  failed.lossPoint = currentFailed;
+  failed.lossPoint = recoveryRoute.lossPoint;
   failed.assignedStripIds = [];
   failed.utilizationPct = 0;
   failed.coverageTimeS = 0;
 
-  const sourceFailed = sourcePlan.uavs.find((uav) => uav.id === failed.id);
   const debtStrips = sourcePlan.strips.filter((strip) => {
     if (strip.assignedUavId !== failed.id) return false;
-    if (strip.status === "blocked_by_nfz") return false;
+    if (strip.status === "blocked_by_nfz" || strip.status === "completed") return false;
     if (!fullSignal) return true;
     if (!sourceFailed) return true;
     return stripCompletionTime(sourceFailed.originalRoute ?? sourceFailed.route, strip.id) > lossDetectedAtS;
@@ -494,7 +634,7 @@ export function applyVehicleLoss(
     plan,
     communicationLostAtS,
     "warning",
-    `${failed.label} communication lost; all UAVs continue original paths for ${COMMUNICATION_LOSS_PERIOD_S}s`,
+    `${failed.label} communication lost; aircraft turns back toward ${plan.homeBase.label} for ${COMMUNICATION_LOSS_PERIOD_S}s`,
     failed.id,
   );
   addEvent(
@@ -502,7 +642,7 @@ export function applyVehicleLoss(
     lossDetectedAtS,
     "danger",
     fullSignal
-      ? `${failed.label} missed health epoch; last GPS point retained for continuation`
+      ? `${failed.label} missed health epoch; last GPS point marks the stopped loss location`
       : `${failed.label} missed alive signal; full assigned sector queued for redo from base`,
     failed.id,
   );
@@ -516,6 +656,8 @@ export function applyVehicleLoss(
   );
 
   const activeUavs = plan.uavs.filter((uav) => uav.status !== "lost" && !uav.reserve);
+  const contingencyPattern = contingencyInfillPattern(plan.config);
+  const contingencySummary = infillPatternSummary(contingencyPattern);
   if (!fullSignal && mode === "spread_remaining_swarm") {
     addEvent(
       plan,
@@ -538,34 +680,27 @@ export function applyVehicleLoss(
     const replacementStrips = plan.strips.filter(
       (strip) => strip.assignedUavId === replacementId,
     );
-    const replacementStart = fullSignal ? currentFailed : plan.homeBase.point;
+    const replacementBase = normalizeHomeBase(plan.homeBase);
+    const replacementStart = replacementBase.point;
     const build = buildRouteFromStart(
       replacementStart,
       lossDetectedAtS + 20,
       replacementStrips,
       plan.config,
-      plan.homeBase,
+      replacementBase,
       failedIndex >= 0 ? failedIndex : plan.uavs.length,
-      !fullSignal,
+      true,
       plan.nfzs,
+      contingencyPattern,
     );
-    const replacementRoute = fullSignal
-      ? [
-          {
-            ...replacementStart,
-            t: lossDetectedAtS + 1,
-            phase: "replacement" as const,
-            label: "last GPS continuation point",
-          },
-          ...build.route.slice(1).map((point) => ({
-            ...point,
-            phase: point.phase === "transit" ? ("replacement" as const) : point.phase,
-          })),
-        ]
-      : build.route.map((point) => ({
-          ...point,
-          phase: point.phase === "transit" ? ("replacement" as const) : point.phase,
-        }));
+    const replacementRoute = build.route.map((point) => ({
+      ...point,
+      phase: point.phase === "transit" ? ("replacement" as const) : point.phase,
+      label:
+        point.phase === "preflight"
+          ? `replacement standby at ${replacementBase.label}`
+          : point.label,
+    }));
     const replacement: UavPlan = {
       id: replacementId,
       label: replacementId.replace("_", "-"),
@@ -590,7 +725,13 @@ export function applyVehicleLoss(
       if (strip) strip.status = "coverage_debt";
     });
     replacement.assignedStripIds = plan.strips
-      .filter((strip) => strip.assignedUavId === replacementId && strip.status !== "coverage_debt")
+      .filter(
+        (strip) =>
+          strip.assignedUavId === replacementId &&
+          strip.status !== "coverage_debt" &&
+          strip.status !== "blocked_by_nfz" &&
+          strip.status !== "completed",
+      )
       .map((strip) => strip.id);
     recomputeUavUtilization(replacement);
     plan.uavs.push(replacement);
@@ -600,8 +741,8 @@ export function applyVehicleLoss(
       "REPLACEMENT_DISPATCH",
       "BASE",
       fullSignal
-        ? "Full-signal loss: replacement continues from last GPS point"
-        : "Silent loss: replacement redoes the full lost sector from base",
+        ? `Full-signal loss: replacement launches from ${replacementBase.label} using ${contingencySummary}`
+        : `Silent loss: replacement launches from ${replacementBase.label} to redo the lost sector using ${contingencySummary}`,
       replacementId,
     );
     addEvent(
@@ -609,21 +750,30 @@ export function applyVehicleLoss(
       lossDetectedAtS + 18,
       "warning",
       fullSignal
-        ? `${replacement.label} continued from ${failed.label} loss point for ${replacementStrips.length} remaining strips`
-        : `${replacement.label} launched from base to redo ${replacementStrips.length} strips without using loss GPS`,
+        ? `${replacement.label} launched from ${replacementBase.label} for ${replacementStrips.length} remaining strips with ${contingencySummary}`
+        : `${replacement.label} launched from ${replacementBase.label} to redo ${replacementStrips.length} strips without using loss GPS`,
       replacementId,
     );
   } else {
-    const nearestInfill = plan.config.pathPattern === "nearest_infill";
-    const workByUav = nearestInfill
-      ? redistributeRemainingStripsGreedy(plan, sourcePlan, activeUavs, lossDetectedAtS)
-      : redistributeRemainingStripsBySector(plan, sourcePlan, activeUavs, lossDetectedAtS);
+    const workByUav = redistributeRemainingStripsForPattern(
+      plan,
+      sourcePlan,
+      activeUavs,
+      lossDetectedAtS,
+      contingencyPattern,
+    );
 
     activeUavs.forEach((uav, index) => {
       const future = workByUav.get(uav.id) ?? pendingAssignedStrips(plan, uav, lossDetectedAtS);
       uav.status = "replanned";
       uav.assignedStripIds = plan.strips
-        .filter((strip) => strip.assignedUavId === uav.id)
+        .filter(
+          (strip) =>
+            strip.assignedUavId === uav.id &&
+            strip.status !== "coverage_debt" &&
+            strip.status !== "blocked_by_nfz" &&
+            strip.status !== "completed",
+        )
         .map((strip) => strip.id);
       buildContinuationForUav(plan, uav, future, lossDetectedAtS + index * 8, index);
     });
@@ -632,9 +782,7 @@ export function applyVehicleLoss(
       lossDetectedAtS + 10,
       "SWARM_REDISTRIBUTE",
       "BASE",
-      nearestInfill
-        ? "Full-signal loss: nearest-infill spread redistributed strips from current UAV positions"
-        : "Full-signal loss: sector-lane spread redistributed contiguous remaining zones",
+      `Full-signal loss: ${contingencySummary} redistributed unfinished strips`,
       undefined,
       activeUavs.map((uav) => uav.id),
     );
@@ -642,9 +790,7 @@ export function applyVehicleLoss(
       plan,
       lossDetectedAtS + 15,
       "warning",
-      nearestInfill
-        ? `Nearest-infill spread rebalanced unfinished strips across ${activeUavs.map((uav) => uav.label).join(", ")}`
-        : `Sector spread redivided unfinished coverage zones across ${activeUavs.map((uav) => uav.label).join(", ")}`,
+      `${contingencySummary} rebalanced unfinished coverage across ${activeUavs.map((uav) => uav.label).join(", ")}`,
     );
   }
 
@@ -875,48 +1021,100 @@ export function applySignalRegain(
   uavId: string,
   requestedTimeS: number,
 ): MissionPlan {
+  const sourceUav = sourcePlan.uavs.find((candidate) => candidate.id === uavId);
+  if (!sourceUav || sourceUav.status !== "lost") return sourcePlan;
+  const sourceLossDetectedAtS = sourceUav.lossDetectedAtS ?? sourceUav.lostAtS;
+
   const plan = clonePlan(sourcePlan);
   const uav = plan.uavs.find((candidate) => candidate.id === uavId);
-  if (!uav || uav.status !== "lost") return plan;
+  if (!uav || uav.status !== "lost") return sourcePlan;
 
-  const routeEndS = uav.route.at(-1)?.t ?? requestedTimeS;
-  const timeS = Math.max(requestedTimeS, uav.lostAtS ?? routeEndS);
-  const regainPoint = uav.lossPoint ?? interpolateRoute(uav.originalRoute ?? uav.route, timeS);
-  const prefix = routeAtOrBefore(uav.route, Math.min(timeS, routeEndS));
-  const returnRoute = buildReturnRouteViaBaseWaypoint({
-    start: regainPoint,
-    startTimeS: timeS,
-    base: plan.homeBase,
-    config: plan.config,
-    nfzs: plan.nfzs,
-    uavIndex: Math.max(0, plan.uavs.findIndex((candidate) => candidate.id === uav.id)),
+  const communicationLostAtS = uav.communicationLostAtS ?? requestedTimeS;
+  const timeS = Math.max(communicationLostAtS, requestedTimeS);
+  const originalRoute = uav.originalRoute ?? uav.route;
+
+  const removedReserveIds = new Set(
+    plan.uavs
+      .filter((candidate) => candidate.reserve && candidate.id.startsWith("UAV_R"))
+      .map((candidate) => candidate.id),
+  );
+  const reclaimedStripIds = new Set<string>();
+  if (removedReserveIds.size > 0) {
+    plan.uavs = plan.uavs.filter((candidate) => !removedReserveIds.has(candidate.id));
+    plan.strips.forEach((strip) => {
+      if (!removedReserveIds.has(strip.assignedUavId)) return;
+      strip.assignedUavId = uav.id;
+      strip.status = "planned";
+      reclaimedStripIds.add(strip.id);
+    });
+  }
+
+  plan.strips.forEach((strip) => {
+    if (strip.status === "blocked_by_nfz" || strip.status === "completed") return;
+    if (stripCompletionTime(originalRoute, strip.id) <= timeS) return;
+
+    const currentOwner = plan.uavs.find((candidate) => candidate.id === strip.assignedUavId);
+    const alreadyCovered =
+      currentOwner &&
+      currentOwner.id !== uav.id &&
+      stripCompletionTime(currentOwner.route, strip.id) <= timeS;
+    if (alreadyCovered) return;
+
+    strip.assignedUavId = uav.id;
+    strip.status = "planned";
+    reclaimedStripIds.add(strip.id);
   });
-  const prefixLast = prefix[prefix.length - 1];
-  const stitchedReturn =
-    prefixLast && distance(prefixLast, returnRoute[0]) < 1 && prefixLast.t === returnRoute[0].t
-      ? returnRoute.slice(1)
-      : returnRoute;
 
-  uav.originalRoute = uav.originalRoute ?? uav.route;
-  uav.route = [...prefix, ...stitchedReturn];
+  const future = plan.strips
+    .filter((strip) => {
+      if (strip.assignedUavId !== uav.id) return false;
+      if (strip.status === "blocked_by_nfz" || strip.status === "coverage_debt") return false;
+      return reclaimedStripIds.has(strip.id) || stripCompletionTime(originalRoute, strip.id) > timeS;
+    })
+    .sort((a, b) => a.order - b.order);
+
+  buildContinuationForUav(
+    plan,
+    uav,
+    future,
+    timeS,
+    Math.max(0, plan.uavs.findIndex((candidate) => candidate.id === uav.id)),
+  );
   uav.status = "regained";
   uav.regainedAtS = timeS;
-  uav.rtbSlotS = uav.route.at(-1)?.t ?? uav.rtbSlotS;
-  uav.utilizationPct = 0;
+  uav.lossDetectedAtS = undefined;
+  uav.lostAtS = undefined;
+  uav.lossPoint = undefined;
+
+  plan.messages = plan.messages.filter((message) => {
+    return !["REPLACEMENT_DISPATCH", "SWARM_REDISTRIBUTE"].includes(message.type);
+  });
+  if (sourceLossDetectedAtS !== undefined) {
+    plan.events = plan.events.filter((event) => {
+      if (event.timeS < sourceLossDetectedAtS) return true;
+      const lowerText = event.text.toLowerCase();
+      return !(
+        lowerText.includes("launched from") ||
+        lowerText.includes("rebalanced unfinished") ||
+        lowerText.includes("redivided unfinished")
+      );
+    });
+  }
+  plan.activeContingency = undefined;
 
   addMessage(
     plan,
     timeS,
     "SIGNAL_REGAINED",
     uav.id,
-    `${uav.label} signal regained; aircraft returning through inbound waypoint`,
+    `${uav.label} signal regained; aircraft resumes unfinished mission work`,
     "BASE",
   );
   addEvent(
     plan,
     timeS,
     "success",
-    `${uav.label} regained signal and is routing back to ${plan.homeBase.label}`,
+    `${uav.label} regained signal and is continuing ${future.length} unfinished strip${future.length === 1 ? "" : "s"}`,
     uav.id,
   );
 

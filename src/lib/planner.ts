@@ -25,6 +25,7 @@ import {
 import type {
   CoverageStrip,
   HomeBase,
+  InfillPattern,
   MapPreset,
   MissionConfig,
   MissionEvent,
@@ -56,18 +57,121 @@ function waypoint(
   return { ...point, t, phase, ...extra };
 }
 
-export function generateCoverageStrips(
+const INFILL_PATTERN_IDS: InfillPattern[] = [
+  "rectilinear",
+  "zigzag",
+  "grid",
+  "triangles",
+  "tri_hex",
+  "diamond",
+  "chevron",
+  "crosshatch",
+  "lattice",
+  "lightning",
+];
+
+type InfillPass = {
+  angleOffsetDeg: number;
+  spacingScale: number;
+  phaseOffset?: number;
+};
+
+export function normalizeInfillPattern(value?: string): InfillPattern {
+  if (INFILL_PATTERN_IDS.includes(value as InfillPattern)) return value as InfillPattern;
+  if (value === "sector_lanes") return "rectilinear";
+  if (value === "alternating_lanes") return "zigzag";
+  if (value === "sector_edge_sweep") return "chevron";
+  if (value === "center_out_sweep") return "diamond";
+  if (value === "nearest_infill") return "lightning";
+  if (value === "interleaved_mesh") return "lattice";
+  return "rectilinear";
+}
+
+export function initialInfillPattern(config: MissionConfig): InfillPattern {
+  return normalizeInfillPattern(config.initialInfillPattern ?? config.pathPattern);
+}
+
+export function contingencyInfillPattern(config: MissionConfig): InfillPattern {
+  return normalizeInfillPattern(
+    config.contingencyInfillPattern ?? config.initialInfillPattern ?? config.pathPattern,
+  );
+}
+
+function infillPasses(pattern: InfillPattern): InfillPass[] {
+  switch (pattern) {
+    case "grid":
+      return [
+        { angleOffsetDeg: 0, spacingScale: 1.82 },
+        { angleOffsetDeg: 90, spacingScale: 1.82, phaseOffset: 0.5 },
+      ];
+    case "triangles":
+      return [
+        { angleOffsetDeg: 0, spacingScale: 2.3 },
+        { angleOffsetDeg: 60, spacingScale: 2.3, phaseOffset: 0.33 },
+        { angleOffsetDeg: -60, spacingScale: 2.3, phaseOffset: 0.66 },
+      ];
+    case "tri_hex":
+      return [
+        { angleOffsetDeg: 0, spacingScale: 2.7 },
+        { angleOffsetDeg: 60, spacingScale: 2.7, phaseOffset: 0.45 },
+        { angleOffsetDeg: 120, spacingScale: 2.7, phaseOffset: 0.9 },
+      ];
+    case "diamond":
+      return [
+        { angleOffsetDeg: 45, spacingScale: 1.85 },
+        { angleOffsetDeg: -45, spacingScale: 1.85, phaseOffset: 0.5 },
+      ];
+    case "chevron":
+      return [
+        { angleOffsetDeg: 32, spacingScale: 1.65 },
+        { angleOffsetDeg: -32, spacingScale: 1.65, phaseOffset: 0.5 },
+      ];
+    case "crosshatch":
+      return [
+        { angleOffsetDeg: 0, spacingScale: 2.25 },
+        { angleOffsetDeg: 90, spacingScale: 2.25, phaseOffset: 0.5 },
+        { angleOffsetDeg: 45, spacingScale: 3.1, phaseOffset: 0.25 },
+        { angleOffsetDeg: -45, spacingScale: 3.1, phaseOffset: 0.75 },
+      ];
+    case "lattice":
+      return [
+        { angleOffsetDeg: 0, spacingScale: 2.45 },
+        { angleOffsetDeg: 60, spacingScale: 2.45, phaseOffset: 0.25 },
+        { angleOffsetDeg: 120, spacingScale: 2.45, phaseOffset: 0.5 },
+        { angleOffsetDeg: 90, spacingScale: 3.4, phaseOffset: 0.75 },
+      ];
+    case "lightning":
+      return [
+        { angleOffsetDeg: 18, spacingScale: 1.35 },
+        { angleOffsetDeg: -48, spacingScale: 2.5, phaseOffset: 0.45 },
+      ];
+    case "zigzag":
+    case "rectilinear":
+    default:
+      return [{ angleOffsetDeg: 0, spacingScale: 1 }];
+  }
+}
+
+function generateCoverageStripsForPass(
   aoo: Point[],
   config: MissionConfig,
+  pattern: InfillPattern,
+  pass: InfillPass,
+  passIndex: number,
+  startOrder: number,
 ): CoverageStrip[] {
-  const angle = (config.stripAngleDeg * Math.PI) / 180;
+  const angle = ((config.stripAngleDeg + pass.angleOffsetDeg) * Math.PI) / 180;
   const rotated = aoo.map((point) => rotatePoint(point, -angle));
   const box = bounds(rotated);
-  const spacing = Math.max(40, config.sensorSwathM * (1 - config.overlapRatio));
+  const baseSpacing = Math.max(40, config.sensorSwathM * (1 - config.overlapRatio));
+  const spacing = Math.max(40, baseSpacing * pass.spacingScale);
+  const phaseOffset = ((pass.phaseOffset ?? 0) % 1 + 1) % 1;
   const strips: CoverageStrip[] = [];
-  let order = 0;
+  let y = box.minY + spacing * (0.5 + phaseOffset);
 
-  for (let y = box.minY + spacing / 2; y <= box.maxY - spacing / 4; y += spacing) {
+  while (y - spacing >= box.minY + spacing * 0.35) y -= spacing;
+
+  for (; y <= box.maxY - spacing / 4; y += spacing) {
     const xs = horizontalLinePolygonIntersections(rotated, y);
     for (let i = 0; i < xs.length - 1; i += 2) {
       const x1 = xs[i];
@@ -75,6 +179,7 @@ export function generateCoverageStrips(
       if (x2 - x1 < config.sensorSwathM * 0.45) continue;
       const start = rotatePoint({ x: x1, y }, angle);
       const end = rotatePoint({ x: x2, y }, angle);
+      const order = startOrder + strips.length;
       strips.push({
         id: `S_${String(order + 1).padStart(2, "0")}`,
         order,
@@ -84,16 +189,55 @@ export function generateCoverageStrips(
         polygon: stripPolygon(start, end, config.sensorSwathM / 2),
         assignedUavId: "",
         status: "planned",
+        infillPattern: pattern,
+        infillPass: passIndex,
       });
-      order += 1;
     }
   }
 
   return strips;
 }
 
+export function generateCoverageStrips(
+  aoo: Point[],
+  config: MissionConfig,
+  pattern: InfillPattern = initialInfillPattern(config),
+): CoverageStrip[] {
+  const strips: CoverageStrip[] = [];
+  infillPasses(pattern).forEach((pass, passIndex) => {
+    strips.push(
+      ...generateCoverageStripsForPass(
+        aoo,
+        config,
+        pattern,
+        pass,
+        passIndex,
+        strips.length,
+      ),
+    );
+  });
+
+  return strips;
+}
+
 function assignStrips(strips: CoverageStrip[], config: MissionConfig): CoverageStrip[] {
   const ordered = [...strips].sort((a, b) => a.order - b.order);
+  const pattern = initialInfillPattern(config);
+  const interleavedPatterns: InfillPattern[] = [
+    "grid",
+    "triangles",
+    "tri_hex",
+    "crosshatch",
+    "lattice",
+    "lightning",
+  ];
+  if (interleavedPatterns.includes(pattern)) {
+    return ordered.map((strip, index) => ({
+      ...strip,
+      assignedUavId: `UAV_${(index % config.uavCount) + 1}`,
+    }));
+  }
+
   const sectorSize = Math.ceil(ordered.length / config.uavCount);
 
   return ordered.map((strip, index) => {
@@ -111,13 +255,41 @@ function stripTraverseCost(
   nfzs: Nfz[],
   uavIndex: number,
 ) {
-  const enterStartCost = safePathLength(cursor, strip.start, nfzs, uavIndex);
-  const enterEndCost = safePathLength(cursor, strip.end, nfzs, uavIndex);
-  const startsAtA = enterStartCost <= enterEndCost;
+  const traversal = bestStripTraversal(cursor, strip, nfzs, uavIndex);
   return {
-    exit: startsAtA ? strip.end : strip.start,
-    cost: Math.min(enterStartCost, enterEndCost) + distance(strip.start, strip.end),
+    exit: traversal.exit,
+    cost: traversal.totalCostM,
   };
+}
+
+function bestStripTraversal(
+  cursor: Point,
+  strip: CoverageStrip,
+  nfzs: Nfz[],
+  uavIndex: number,
+  homeBase?: HomeBase,
+) {
+  const candidates = [
+    { entry: strip.start, exit: strip.end },
+    { entry: strip.end, exit: strip.start },
+  ].map((candidate) => {
+    const transitCostM = safePathLength(cursor, candidate.entry, nfzs, uavIndex);
+    const coverageCostM = safePathLength(candidate.entry, candidate.exit, nfzs, uavIndex);
+    const returnCostM = homeBase
+      ? safePathLength(candidate.exit, homeBase.point, nfzs, uavIndex)
+      : 0;
+    return {
+      ...candidate,
+      transitCostM,
+      coverageCostM,
+      returnCostM,
+      totalCostM: transitCostM + coverageCostM + returnCostM,
+    };
+  });
+
+  return candidates.reduce((best, candidate) =>
+    candidate.totalCostM < best.totalCostM ? candidate : best,
+  );
 }
 
 function enduranceBudgetS(config: MissionConfig) {
@@ -162,23 +334,80 @@ function appendLaunchSequence(
   }
 }
 
-export function orderCoverageStripsForPathPattern(
-  strips: CoverageStrip[],
-  config: MissionConfig,
-  start: Point,
-  uavIndex: number,
-  nfzs: Nfz[] = [],
-): CoverageStrip[] {
+function edgeFirstOrder(strips: CoverageStrip[], uavIndex: number): CoverageStrip[] {
   const ordered = [...strips].sort((a, b) => a.order - b.order);
-  const pattern = config.pathPattern ?? "sector_lanes";
+  const result: CoverageStrip[] = [];
+  let left = 0;
+  let right = ordered.length - 1;
+  const startFromHighEdge = uavIndex % 2 === 1;
 
-  if (pattern === "alternating_lanes") {
-    return uavIndex % 2 === 0 ? ordered : ordered.reverse();
+  while (left <= right) {
+    if (startFromHighEdge) {
+      result.push(ordered[right]);
+      right -= 1;
+      if (left <= right) {
+        result.push(ordered[left]);
+        left += 1;
+      }
+    } else {
+      result.push(ordered[left]);
+      left += 1;
+      if (left <= right) {
+        result.push(ordered[right]);
+        right -= 1;
+      }
+    }
   }
 
-  if (pattern !== "nearest_infill") return ordered;
+  return result;
+}
 
-  const pending = [...ordered];
+function centerOutOrder(strips: CoverageStrip[], uavIndex: number): CoverageStrip[] {
+  const ordered = [...strips].sort((a, b) => a.order - b.order);
+  const center = (ordered.length - 1) / 2;
+  return ordered
+    .map((strip, index) => ({ strip, index }))
+    .sort((a, b) => {
+      const aDistance = Math.abs(a.index - center);
+      const bDistance = Math.abs(b.index - center);
+      if (aDistance !== bDistance) return aDistance - bDistance;
+      return uavIndex % 2 === 0 ? a.index - b.index : b.index - a.index;
+    })
+    .map(({ strip }) => strip);
+}
+
+function interleavePassesOrder(strips: CoverageStrip[], uavIndex: number): CoverageStrip[] {
+  const byPass = new Map<number, CoverageStrip[]>();
+  [...strips]
+    .sort((a, b) => a.order - b.order)
+    .forEach((strip) => {
+      const pass = strip.infillPass ?? 0;
+      byPass.set(pass, [...(byPass.get(pass) ?? []), strip]);
+    });
+
+  const passIds = [...byPass.keys()].sort((a, b) => a - b);
+  const longest = Math.max(0, ...[...byPass.values()].map((passStrips) => passStrips.length));
+  const result: CoverageStrip[] = [];
+
+  for (let row = 0; row < longest; row += 1) {
+    const passOrder = uavIndex % 2 === 0 ? passIds : [...passIds].reverse();
+    passOrder.forEach((passId) => {
+      const passStrips = byPass.get(passId) ?? [];
+      const strip = passStrips[row];
+      if (strip) result.push(strip);
+    });
+  }
+
+  return result;
+}
+
+function nearestTravelOrder(
+  strips: CoverageStrip[],
+  start: Point,
+  uavIndex: number,
+  nfzs: Nfz[],
+): CoverageStrip[] {
+  const pending = [...strips].sort((a, b) => a.order - b.order);
   const result: CoverageStrip[] = [];
   let cursor = start;
 
@@ -200,6 +429,49 @@ export function orderCoverageStripsForPathPattern(
   return result;
 }
 
+export function orderCoverageStripsForInfillPattern(
+  strips: CoverageStrip[],
+  config: MissionConfig,
+  start: Point,
+  uavIndex: number,
+  nfzs: Nfz[] = [],
+  pattern: InfillPattern = initialInfillPattern(config),
+): CoverageStrip[] {
+  const ordered = [...strips].sort((a, b) => a.order - b.order);
+
+  if (pattern === "zigzag") {
+    return uavIndex % 2 === 0 ? ordered : ordered.reverse();
+  }
+
+  if (pattern === "chevron") return edgeFirstOrder(ordered, uavIndex);
+
+  if (pattern === "diamond") return centerOutOrder(ordered, uavIndex);
+
+  if (pattern === "grid") return interleavePassesOrder(ordered, uavIndex);
+
+  if (
+    pattern === "triangles" ||
+    pattern === "tri_hex" ||
+    pattern === "crosshatch" ||
+    pattern === "lattice" ||
+    pattern === "lightning"
+  ) {
+    return nearestTravelOrder(ordered, start, uavIndex, nfzs);
+  }
+
+  return ordered;
+}
+
+export function orderCoverageStripsForPathPattern(
+  strips: CoverageStrip[],
+  config: MissionConfig,
+  start: Point,
+  uavIndex: number,
+  nfzs: Nfz[] = [],
+): CoverageStrip[] {
+  return orderCoverageStripsForInfillPattern(strips, config, start, uavIndex, nfzs);
+}
+
 function buildCoverageRoute(
   start: Point,
   startTimeS: number,
@@ -209,8 +481,16 @@ function buildCoverageRoute(
   includeLaunch: boolean,
   nfzs: Nfz[] = [],
   homeBase?: HomeBase,
+  pattern: InfillPattern = initialInfillPattern(config),
 ): RouteBuildResult {
-  const orderedStrips = orderCoverageStripsForPathPattern(strips, config, start, uavIndex, nfzs);
+  const orderedStrips = orderCoverageStripsForInfillPattern(
+    strips,
+    config,
+    start,
+    uavIndex,
+    nfzs,
+    pattern,
+  );
   const route: RouteWaypoint[] = [waypoint(start, startTimeS, includeLaunch ? "preflight" : "transit")];
   let coverageTimeS = 0;
   let sortieStartS = startTimeS;
@@ -225,15 +505,11 @@ function buildCoverageRoute(
 
   orderedStrips.forEach((strip, idx) => {
     let current = route[route.length - 1];
-    const startsAtA = distance(current, strip.start) <= distance(current, strip.end);
-    let entry = startsAtA ? strip.start : strip.end;
-    let exit = startsAtA ? strip.end : strip.start;
+    let traversal = bestStripTraversal(current, strip, nfzs, uavIndex, homeBase);
+    let entry = traversal.entry;
+    let exit = traversal.exit;
     if (homeBase) {
-      const requiredS =
-        (safePathLength(current, entry, nfzs, uavIndex) +
-          safePathLength(entry, exit, nfzs, uavIndex) +
-          safePathLength(exit, homeBase.point, nfzs, uavIndex)) /
-        config.speedMps;
+      const requiredS = traversal.totalCostM / config.speedMps;
       const elapsedS = current.t - sortieStartS;
       if (elapsedS + requiredS > enduranceBudgetS(config)) {
         forcedRtbCount += 1;
@@ -256,16 +532,10 @@ function buildCoverageRoute(
         current = route[route.length - 1];
       }
 
-      const freshStartsAtA = distance(current, strip.start) <= distance(current, strip.end);
-      const freshEntry = freshStartsAtA ? strip.start : strip.end;
-      const freshExit = freshStartsAtA ? strip.end : strip.start;
-      entry = freshEntry;
-      exit = freshExit;
-      const freshRequiredS =
-        (safePathLength(current, freshEntry, nfzs, uavIndex) +
-          safePathLength(freshEntry, freshExit, nfzs, uavIndex) +
-          safePathLength(freshExit, homeBase.point, nfzs, uavIndex)) /
-        config.speedMps;
+      traversal = bestStripTraversal(current, strip, nfzs, uavIndex, homeBase);
+      entry = traversal.entry;
+      exit = traversal.exit;
+      const freshRequiredS = traversal.totalCostM / config.speedMps;
       if (current.t - sortieStartS + freshRequiredS > enduranceBudgetS(config)) {
         skippedStripIds.push(strip.id);
         return;
@@ -355,6 +625,7 @@ export function buildRouteFromStart(
   uavIndex: number,
   includeLaunch = false,
   nfzs: Nfz[] = [],
+  pattern: InfillPattern = initialInfillPattern(config),
 ): RouteBuildResult {
   const homeBase =
     "outboundWaypoints" in base ? normalizeHomeBase(base) : homeBaseFromPoint(base);
@@ -367,6 +638,7 @@ export function buildRouteFromStart(
     includeLaunch,
     nfzs,
     homeBase,
+    pattern,
   );
   const desiredArrivalS = Math.max(
     result.coverageEndS + safePathLength(result.endPoint, homeBase.point, nfzs, uavIndex) / config.speedMps + 60,
@@ -424,7 +696,10 @@ function buildMissionPlan(
 ): MissionPlan {
   const homeBase = "outboundWaypoints" in base ? normalizeHomeBase(base) : homeBaseFromPoint(base);
   const basePoint = homeBase.point;
-  const assignedStrips = assignStrips(generateCoverageStrips(aoo, config), config).map((strip) => {
+  const assignedStrips = assignStrips(
+    generateCoverageStrips(aoo, config, initialInfillPattern(config)),
+    config,
+  ).map((strip) => {
     const blocked = nfzs.some((nfz) => {
       if (nfz.polygon?.length) {
         return (
@@ -457,7 +732,12 @@ function buildMissionPlan(
     });
     const routeEnd = build.route[build.route.length - 1]?.t ?? 1;
     const assignedStripIds = strips
-      .filter((strip) => strip.status !== "coverage_debt")
+      .filter(
+        (strip) =>
+          strip.status !== "coverage_debt" &&
+          strip.status !== "blocked_by_nfz" &&
+          strip.status !== "completed",
+      )
       .map((strip) => strip.id);
     return {
       id: uavId,
@@ -510,7 +790,13 @@ function buildMissionPlan(
     uav.forcedRtbCount = rebuilt.forcedRtbCount;
     uav.enduranceWarning = rebuilt.enduranceWarning;
     uav.assignedStripIds = assignedStrips
-      .filter((strip) => strip.assignedUavId === uav.id && strip.status !== "coverage_debt")
+      .filter(
+        (strip) =>
+          strip.assignedUavId === uav.id &&
+          strip.status !== "coverage_debt" &&
+          strip.status !== "blocked_by_nfz" &&
+          strip.status !== "completed",
+      )
       .map((strip) => strip.id);
     uav.rtbSlotS = rebuilt.route.at(-1)?.t ?? uav.rtbSlotS;
     const routeEnd = rebuilt.route.at(-1)?.t ?? 1;

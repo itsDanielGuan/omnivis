@@ -1,7 +1,7 @@
 import { closeRing, localCircleToLngLat, pointsToLngLat, toLngLat } from "@/lib/geo";
 import { getUavSnapshot } from "@/lib/simulator";
 import type { Feature, FeatureCollection, Geometry } from "geojson";
-import type { MissionMessage, MissionPlan, Point, RouteWaypoint } from "@/lib/types";
+import type { CoverageStrip, MissionMessage, MissionPlan, Point, RouteWaypoint, UavPlan } from "@/lib/types";
 
 function feature(
   geometry: Geometry,
@@ -40,12 +40,39 @@ function endpointForId(plan: MissionPlan, id: string, simTimeS: number): Point {
   return getUavSnapshot(uav, simTimeS);
 }
 
+function pendingVehicleLossActivationS(plan: MissionPlan, simTimeS: number): number | undefined {
+  if (plan.activeContingency !== "vehicle_loss") return undefined;
+  const activationS = Math.min(
+    ...plan.uavs
+      .map((uav) => uav.lossDetectedAtS ?? uav.lostAtS)
+      .filter((timeS): timeS is number => timeS !== undefined),
+  );
+  return Number.isFinite(activationS) && simTimeS < activationS ? activationS : undefined;
+}
+
+function originalOwnerForStrip(plan: MissionPlan, strip: CoverageStrip): string | undefined {
+  return plan.uavs.find((uav) =>
+    (uav.originalRoute ?? uav.route).some((point) => point.stripId === strip.id),
+  )?.id;
+}
+
+function visibleRouteForUav(
+  uav: UavPlan,
+  activationS: number | undefined,
+): RouteWaypoint[] {
+  if (!activationS) return uav.route;
+  if (uav.reserve) return [];
+  if (uav.communicationLostAtS !== undefined) return uav.route;
+  return uav.originalRoute ?? uav.route;
+}
+
 export function missionToGeoJson(
   plan: MissionPlan,
   simTimeS: number,
   selectedUavId?: string,
 ): FeatureCollection {
   const features: Feature[] = [];
+  const vehicleLossActivationS = pendingVehicleLossActivationS(plan, simTimeS);
 
   features.push(
     feature(
@@ -58,7 +85,12 @@ export function missionToGeoJson(
   );
 
   plan.strips.forEach((strip) => {
-    const owner = plan.uavs.find((uav) => uav.id === strip.assignedUavId);
+    const ownerId = vehicleLossActivationS
+      ? originalOwnerForStrip(plan, strip) ?? strip.assignedUavId
+      : strip.assignedUavId;
+    const owner = plan.uavs.find((uav) => uav.id === ownerId);
+    const status =
+      vehicleLossActivationS && strip.status === "coverage_debt" ? "planned" : strip.status;
     features.push(
       feature(
         {
@@ -68,12 +100,12 @@ export function missionToGeoJson(
         {
           kind: "strip",
           id: strip.id,
-          ownerId: strip.assignedUavId,
-          status: strip.status,
+          ownerId,
+          status,
           color:
-            strip.status === "coverage_debt"
+            status === "coverage_debt"
               ? "#f97316"
-              : strip.status === "blocked_by_nfz"
+              : status === "blocked_by_nfz"
                 ? "#ef4444"
                 : owner?.colorSoft ?? "rgba(148, 163, 184, 0.18)",
           lineColor: owner?.color ?? "#94a3b8",
@@ -83,7 +115,10 @@ export function missionToGeoJson(
   });
 
   plan.uavs.forEach((uav) => {
-    const routeFeature = lineFromRoute(plan, uav.route, {
+    if (uav.reserve && simTimeS < (uav.route[0]?.t ?? 0)) return;
+
+    const visibleRoute = visibleRouteForUav(uav, vehicleLossActivationS);
+    const routeFeature = lineFromRoute(plan, visibleRoute, {
       kind: "route",
       id: `${uav.id}_route`,
       uavId: uav.id,
@@ -92,7 +127,7 @@ export function missionToGeoJson(
     });
     if (routeFeature) features.push(routeFeature);
 
-    if (uav.originalRoute) {
+    if (uav.originalRoute && (!vehicleLossActivationS || uav.communicationLostAtS !== undefined)) {
       const originalFeature = lineFromRoute(plan, uav.originalRoute, {
         kind: "original_route",
         id: `${uav.id}_original_route`,

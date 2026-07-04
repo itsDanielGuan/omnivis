@@ -411,6 +411,86 @@ function compactSafePath(points: Point[], nfzs: Nfz[]): Point[] {
   return compacted;
 }
 
+function shortestVisibilityPathAtClearance(
+  start: Point,
+  target: Point,
+  nfzs: Nfz[],
+  clearanceM: number,
+): Point[] | undefined {
+  if (nfzs.some((nfz) => pointInsideNfz(start, nfz) || pointInsideNfz(target, nfz))) {
+    return undefined;
+  }
+
+  const nodes = dedupePath([
+    start,
+    target,
+    ...nfzs.flatMap((nfz) => nfzEnvelopePoints(nfz, clearanceM)),
+  ]).filter((point) => !nfzs.some((nfz) => pointInsideNfz(point, nfz)));
+  const startIndex = nodes.findIndex((point) => distance(point, start) < 0.5);
+  const targetIndex = nodes.findIndex((point) => distance(point, target) < 0.5);
+  if (startIndex < 0 || targetIndex < 0) return undefined;
+
+  const costs = Array.from({ length: nodes.length }, () => Number.POSITIVE_INFINITY);
+  const previous = Array.from({ length: nodes.length }, () => -1);
+  const visited = Array.from({ length: nodes.length }, () => false);
+  costs[startIndex] = 0;
+
+  for (let step = 0; step < nodes.length; step += 1) {
+    let current = -1;
+    let currentCost = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < nodes.length; index += 1) {
+      if (!visited[index] && costs[index] < currentCost) {
+        current = index;
+        currentCost = costs[index];
+      }
+    }
+    if (current < 0 || current === targetIndex) break;
+
+    visited[current] = true;
+    for (let next = 0; next < nodes.length; next += 1) {
+      if (next === current || visited[next]) continue;
+      if (firstBlockingNfz(nodes[current], nodes[next], nfzs)) continue;
+      const nextCost = currentCost + distance(nodes[current], nodes[next]);
+      if (nextCost < costs[next]) {
+        costs[next] = nextCost;
+        previous[next] = current;
+      }
+    }
+  }
+
+  if (!Number.isFinite(costs[targetIndex])) return undefined;
+
+  const path: Point[] = [];
+  let cursor = targetIndex;
+  for (let guard = 0; cursor >= 0 && guard <= nodes.length; guard += 1) {
+    path.push(nodes[cursor]);
+    if (cursor === startIndex) break;
+    cursor = previous[cursor];
+  }
+  if (path[path.length - 1] !== nodes[startIndex]) return undefined;
+
+  const candidate = compactSafePath(path.reverse(), nfzs);
+  return candidateIsSafe(start, target, candidate.slice(1, -1), nfzs)
+    ? candidate
+    : undefined;
+}
+
+function shortestVisibilityPath(
+  start: Point,
+  target: Point,
+  nfzs: Nfz[],
+): Point[] | undefined {
+  const clearances = [55, 85, 130, 200, 320];
+  const candidates = clearances
+    .map((clearance) => shortestVisibilityPathAtClearance(start, target, nfzs, clearance))
+    .filter((candidate): candidate is Point[] => Boolean(candidate));
+
+  if (candidates.length === 0) return undefined;
+  return candidates.reduce((best, candidate) =>
+    routeLength(candidate) < routeLength(best) ? candidate : best,
+  );
+}
+
 export function safePathPoints(
   start: Point,
   target: Point,
@@ -418,6 +498,10 @@ export function safePathPoints(
   uavIndex = 0,
 ): Point[] {
   if (nfzs.length === 0 || distance(start, target) < 0.1) return [start, target];
+  if (!firstBlockingNfz(start, target, nfzs)) return [start, target];
+
+  const shortestPath = shortestVisibilityPath(start, target, nfzs);
+  if (shortestPath) return shortestPath;
 
   const points: Point[] = [start, target];
   for (let pass = 0; pass < 24; pass += 1) {
