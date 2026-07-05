@@ -203,27 +203,36 @@ export function missionToGeoJson(
   });
 
   plan.threats.forEach((threat) => {
-    const destroyed = threat.phase === "destroyed";
+    const destroyed =
+      threat.phase === "destroyed" ||
+      (threat.phase === "striking" && (threat.strike?.impactS ?? Infinity) <= simTimeS);
     const friendly = threat.phase === "friendly";
+    const pending = threat.phase === "undetected";
     const color = destroyed
       ? "#6b7280"
       : friendly
         ? "#22c55e"
-        : threat.kind === "large"
-          ? "#ef4444"
-          : threat.kind === "small"
-            ? "#f97316"
-            : "#f59e0b";
+        : pending
+          ? "#a3a3a3"
+          : threat.kind === "large"
+            ? "#ef4444"
+            : threat.kind === "small"
+              ? "#f97316"
+              : "#f59e0b";
     const ringRadius = threat.kind === "large" ? 340 : threat.kind === "small" ? 230 : 160;
     const label = friendly
       ? "FRIENDLY"
       : destroyed
         ? "DESTROYED"
-        : threat.kind === "merchant"
-          ? "MERCHANT?"
-          : threat.kind === "small"
-            ? "SMALL"
-            : "LARGE";
+        : threat.phase === "striking"
+          ? "STRIKE"
+          : pending
+            ? "CONTACT?"
+            : threat.kind === "merchant"
+              ? "MERCHANT?"
+              : threat.kind === "small"
+                ? "SMALL"
+                : "LARGE";
     features.push(
       feature(
         {

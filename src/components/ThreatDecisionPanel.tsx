@@ -22,6 +22,9 @@ export function ThreatDecisionPanel({ threat, strikeBaseLabel, onLoiter, onStrik
   const defaults = STRIKE_DEFAULTS[threat.kind];
   const [strikeType, setStrikeType] = useState<StrikeType>(defaults.type);
   const [droneCount, setDroneCount] = useState(defaults.count);
+  const strikeMin = strikeType === "saturation" && threat.kind !== "large" ? 1 : defaults.min;
+  const strikeMax = strikeType === "saturation" ? 20 : defaults.max;
+  const clampedDroneCount = Math.min(strikeMax, Math.max(strikeMin, droneCount));
 
   return (
     <section className="shrink-0 border border-red-400/40 bg-red-500/10 p-3">
@@ -69,14 +72,14 @@ export function ThreatDecisionPanel({ threat, strikeBaseLabel, onLoiter, onStrik
             <Radar className="size-3" />
             Strike drones
           </span>
-          <span className="font-mono text-neutral-100">{droneCount}</span>
+          <span className="font-mono text-neutral-100">{clampedDroneCount}</span>
         </label>
         <input
           className="mb-2 h-1.5 w-full accent-red-400"
           type="range"
-          min={defaults.min}
-          max={defaults.max}
-          value={droneCount}
+          min={strikeMin}
+          max={strikeMax}
+          value={clampedDroneCount}
           onChange={(event) => setDroneCount(Number(event.target.value))}
         />
 
@@ -89,10 +92,10 @@ export function ThreatDecisionPanel({ threat, strikeBaseLabel, onLoiter, onStrik
 
         <button
           className="flex w-full items-center justify-center gap-2 border border-red-400/60 bg-red-500/20 px-3 py-2 text-xs font-semibold text-red-100 transition hover:bg-red-500/30"
-          onClick={() => onStrike(strikeType, droneCount)}
+          onClick={() => onStrike(strikeType, clampedDroneCount)}
         >
           <Crosshair className="size-3.5" />
-          Launch {droneCount}-drone {strikeType} strike
+          Launch {clampedDroneCount}-drone {strikeType} strike
         </button>
       </div>
     </section>

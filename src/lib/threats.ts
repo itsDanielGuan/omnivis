@@ -302,31 +302,31 @@ function isCoverageSearcher(uav: UavPlan): boolean {
   );
 }
 
-function earliestDetection(
+function earliestDetectionInWindow(
   plan: MissionPlan,
   point: Point,
   fromTimeS: number,
+  toTimeS: number,
 ): { uav: UavPlan; timeS: number } | undefined {
   let best: { uav: UavPlan; timeS: number } | undefined;
-  let fallback: { uav: UavPlan; timeS: number; dist: number } | undefined;
+  const startS = Math.max(0, Math.min(fromTimeS, toTimeS));
+  const endS = Math.max(startS, Math.max(fromTimeS, toTimeS));
 
   plan.uavs.filter(isCoverageSearcher).forEach((uav) => {
     const radius = detectionRadiusM(plan.config, uav.altitudeM);
     const end = uav.route.at(-1)?.t ?? 0;
-    const start = Math.max(fromTimeS, uav.route[0]?.t ?? 0);
-    for (let t = start; t <= end; t += 1) {
+    const start = Math.max(startS, uav.route[0]?.t ?? 0);
+    const stop = Math.min(endS, end);
+    for (let t = start; t <= stop + 0.05; t += 1) {
       const pos = interpolateRoute(uav.route, t);
-      const d = distance(pos, point);
-      if (!fallback || d < fallback.dist) fallback = { uav, timeS: t, dist: d };
-      if (d <= radius) {
+      if (distance(pos, point) <= radius) {
         if (!best || t < best.timeS) best = { uav, timeS: t };
         break;
       }
     }
   });
 
-  if (best) return best;
-  return fallback ? { uav: fallback.uav, timeS: fallback.timeS } : undefined;
+  return best;
 }
 
 function nearestOtherSearcher(
@@ -355,6 +355,15 @@ export function applyThreat(
   point: Point,
   requestedTimeS: number,
 ): MissionPlan {
+  return stageThreat(sourcePlan, kind, point, requestedTimeS);
+}
+
+export function stageThreat(
+  sourcePlan: MissionPlan,
+  kind: ThreatKind,
+  point: Point,
+  requestedTimeS: number,
+): MissionPlan {
   const plan = clonePlan(sourcePlan);
   const timeS = Math.max(0, requestedTimeS);
   const threat: Threat = {
@@ -362,17 +371,31 @@ export function applyThreat(
     kind,
     point,
     createdAtS: timeS,
-    phase: "confirming",
+    phase: "undetected",
   };
   plan.threats.push(threat);
+  addEvent(plan, timeS, "info", `${threatLabel(kind)} added to the mission map; awaiting onboard detection`);
+  plan.metrics = computeMissionMetrics(plan);
+  return plan;
+}
 
-  const detection = earliestDetection(plan, point, timeS);
+function activateThreatInWindow(
+  sourcePlan: MissionPlan,
+  threatId: string,
+  fromTimeS: number,
+  toTimeS: number,
+): MissionPlan {
+  const sourceThreat = sourcePlan.threats.find((candidate) => candidate.id === threatId);
+  if (!sourceThreat || sourceThreat.phase !== "undetected") return sourcePlan;
+
+  const detection = earliestDetectionInWindow(sourcePlan, sourceThreat.point, fromTimeS, toTimeS);
   if (!detection) {
-    addEvent(plan, timeS, "warning", `${threatLabel(kind)} placed but no searching UAV can reach it`);
-    plan.metrics = computeMissionMetrics(plan);
-    return plan;
+    return sourcePlan;
   }
 
+  const plan = clonePlan(sourcePlan);
+  const threat = plan.threats.find((candidate) => candidate.id === threatId) as Threat;
+  threat.phase = "confirming";
   const discoverer = plan.uavs.find((uav) => uav.id === detection.uav.id) as UavPlan;
   const detectedAtS = detection.timeS;
   threat.detectedByUavId = discoverer.id;
@@ -381,10 +404,10 @@ export function applyThreat(
   const keepOut = threatKeepOut(threat);
   const avoidNfzs = [...plan.nfzs, keepOut];
   const discovererIndex = plan.uavs.findIndex((uav) => uav.id === discoverer.id);
-  const loiterR = loiterRadiusM(plan.config, kind);
+  const loiterR = loiterRadiusM(plan.config, threat.kind);
 
   // Second drone (nearest other searcher) is dispatched to confirm.
-  const second = nearestOtherSearcher(plan, discoverer, point, detectedAtS);
+  const second = nearestOtherSearcher(plan, discoverer, threat.point, detectedAtS);
   const secondIndex = second
     ? plan.uavs.findIndex((uav) => uav.id === second.id)
     : -1;
@@ -398,7 +421,7 @@ export function applyThreat(
   threat.confirmUavId = second?.id;
   threat.confirmArrivalS = confirmArrivalS;
 
-  const isFriendly = kind === "merchant";
+  const isFriendly = threat.kind === "merchant";
   const resolveS = isFriendly ? confirmArrivalS + MERCHANT_DWELL_S : undefined;
   const untilS = resolveS ?? confirmArrivalS + AWAIT_ORBIT_S;
 
@@ -465,7 +488,7 @@ export function applyThreat(
     plan,
     detectedAtS,
     "warning",
-    `${discoverer.label} detected a ${threatLabel(kind)} and is loitering the contact`,
+    `${discoverer.label} detected a ${threatLabel(threat.kind)} and is loitering the contact`,
     discoverer.id,
   );
   if (second) {
@@ -493,11 +516,28 @@ export function applyThreat(
       plan,
       confirmArrivalS,
       "danger",
-      `${threatLabel(kind)} confirmed hostile; operator decision required (loiter or strike)`,
+      `${threatLabel(threat.kind)} confirmed hostile; operator decision required (loiter or strike)`,
     );
   }
 
   plan.metrics = computeMissionMetrics(plan);
+  return plan;
+}
+
+export function detectThreatsInRange(
+  sourcePlan: MissionPlan,
+  fromTimeS: number,
+  toTimeS: number,
+): MissionPlan {
+  let plan = sourcePlan;
+  const candidates = sourcePlan.threats
+    .filter((threat) => threat.phase === "undetected")
+    .map((threat) => threat.id);
+
+  candidates.forEach((threatId) => {
+    plan = activateThreatInWindow(plan, threatId, fromTimeS, toTimeS);
+  });
+
   return plan;
 }
 
@@ -665,7 +705,7 @@ export function applyThreatDecision(
       impactS,
     };
     resolveS = impactS;
-    threat.phase = "destroyed";
+    threat.phase = "striking";
     threat.resolvedAtS = impactS;
     addEvent(
       plan,

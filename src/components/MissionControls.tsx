@@ -31,12 +31,13 @@ import type {
   MissionConfig,
   PlanningArea,
   PlanningNfz,
+  PlanningThreat,
   ThreatKind,
 } from "@/lib/types";
 
 type ActionMenu =
   | {
-      kind: "area" | "base" | "nfz";
+      kind: "area" | "base" | "nfz" | "threat";
       id: string;
       x: number;
       y: number;
@@ -44,7 +45,7 @@ type ActionMenu =
   | null;
 
 type PendingDelete = {
-  kind: "area" | "base" | "nfz";
+  kind: "area" | "base" | "nfz" | "threat";
   id: string;
   label: string;
 } | null;
@@ -57,9 +58,11 @@ type Props = {
   areas: PlanningArea[];
   homeBases: HomeBase[];
   planningNfzs: PlanningNfz[];
+  planningThreats: PlanningThreat[];
   selectedAreaId?: string;
   selectedBaseId?: string;
   selectedNfzId?: string;
+  selectedThreatId?: string;
   draftPointCount: number;
   canCompile: boolean;
   canDeleteSelected: boolean;
@@ -70,6 +73,7 @@ type Props = {
   onSelectedAreaChange: (areaId: string | undefined) => void;
   onSelectedBaseChange: (baseId: string | undefined) => void;
   onSelectedNfzChange: (nfzId: string | undefined) => void;
+  onSelectedThreatChange: (threatId: string | undefined) => void;
   onFinishPolygon: () => void;
   onCancelDraft: () => void;
   onLinkBaseToArea: () => void;
@@ -85,6 +89,7 @@ type Props = {
   onDeleteArea: (areaId: string) => void;
   onDeleteBase: (baseId: string) => void;
   onDeleteNfz: (nfzId: string) => void;
+  onDeleteThreat: (threatId: string) => void;
   onToggleNfzEnabled: (nfzId: string) => void;
   onToggleBaseAvailability: () => void;
   onAddBaseWaypoint: (direction: "outbound" | "inbound") => void;
@@ -303,9 +308,11 @@ export function MissionControls({
   areas,
   homeBases,
   planningNfzs,
+  planningThreats,
   selectedAreaId,
   selectedBaseId,
   selectedNfzId,
+  selectedThreatId,
   draftPointCount,
   canCompile,
   canDeleteSelected,
@@ -315,6 +322,7 @@ export function MissionControls({
   onSelectedAreaChange,
   onSelectedBaseChange,
   onSelectedNfzChange,
+  onSelectedThreatChange,
   onFinishPolygon,
   onCancelDraft,
   onLinkBaseToArea,
@@ -330,6 +338,7 @@ export function MissionControls({
   onDeleteArea,
   onDeleteBase,
   onDeleteNfz,
+  onDeleteThreat,
   onToggleNfzEnabled,
   onToggleBaseAvailability,
   onAddBaseWaypoint,
@@ -388,7 +397,7 @@ export function MissionControls({
   }, [actionMenu]);
 
   const openActionMenu = (
-    kind: "area" | "base" | "nfz",
+    kind: "area" | "base" | "nfz" | "threat",
     id: string,
     event: React.MouseEvent<HTMLButtonElement>,
   ) => {
@@ -406,13 +415,18 @@ export function MissionControls({
 
   const closeActionMenu = () => setActionMenu(null);
 
-  const deleteLabel = (kind: "area" | "base" | "nfz", id: string) => {
+  const deleteLabel = (kind: "area" | "base" | "nfz" | "threat", id: string) => {
     if (kind === "area") return areas.find((area) => area.id === id)?.label ?? "Unnamed zone";
     if (kind === "base") return homeBases.find((base) => base.id === id)?.label ?? "Unnamed base";
-    return planningNfzs.find((nfz) => nfz.id === id)?.label ?? "Unnamed NFZ";
+    if (kind === "nfz") return planningNfzs.find((nfz) => nfz.id === id)?.label ?? "Unnamed NFZ";
+    const threat = planningThreats.find((candidate) => candidate.id === id);
+    if (!threat) return "Unnamed threat";
+    if (threat.kind === "merchant") return "Merchant threat target";
+    if (threat.kind === "large") return "Large threat target";
+    return "Small threat target";
   };
 
-  const requestDelete = (kind: "area" | "base" | "nfz", id: string) => {
+  const requestDelete = (kind: "area" | "base" | "nfz" | "threat", id: string) => {
     setPendingDelete({ kind, id, label: deleteLabel(kind, id) });
     closeActionMenu();
   };
@@ -424,6 +438,8 @@ export function MissionControls({
       requestDelete("base", selectedBaseId);
     } else if (selectedNfzId) {
       requestDelete("nfz", selectedNfzId);
+    } else if (selectedThreatId) {
+      requestDelete("threat", selectedThreatId);
     }
   };
 
@@ -432,6 +448,7 @@ export function MissionControls({
     if (pendingDelete.kind === "area") onDeleteArea(pendingDelete.id);
     if (pendingDelete.kind === "base") onDeleteBase(pendingDelete.id);
     if (pendingDelete.kind === "nfz") onDeleteNfz(pendingDelete.id);
+    if (pendingDelete.kind === "threat") onDeleteThreat(pendingDelete.id);
     setPendingDelete(null);
   };
 
@@ -566,8 +583,8 @@ export function MissionControls({
         </div>
         <div className="mt-2 border border-white/10 bg-black p-2 text-xs text-neutral-400">
           {editorMode === "place_threat"
-            ? "Click the map to drop the selected threat onto a searching drone's path."
-            : "Compile and run a mission, pick a threat type, then click the map to drop it."}
+            ? "Click the map to stage the selected threat. It will be detected when a UAV comes in range."
+            : "Pick a threat type, click the map before or after compile, then run the mission to detect it dynamically."}
         </div>
       </div>
 
@@ -578,7 +595,7 @@ export function MissionControls({
             Mission Files
           </div>
           <span className="font-mono text-[10px] uppercase tracking-wide text-neutral-500">
-            {areas.length + homeBases.length + planningNfzs.length} items
+            {areas.length + homeBases.length + planningNfzs.length + planningThreats.length} items
           </span>
         </div>
         <div className="max-h-96 space-y-3 overflow-y-auto text-xs">
@@ -773,6 +790,56 @@ export function MissionControls({
                       <span className="text-neutral-500">
                         {nfz.polygon.length} restricted polygon points
                       </span>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          <div className="space-y-1.5 border-t border-white/10 pt-3">
+            <div className="flex items-center justify-between px-1 text-[10px] font-semibold uppercase tracking-wide text-rose-300/80">
+              <span>Threat targets</span>
+              <span className="font-mono text-neutral-500">{planningThreats.length}</span>
+            </div>
+            {planningThreats.length === 0 ? (
+              <div className="border border-white/10 bg-black px-2 py-2 text-neutral-600">
+                No staged threat targets yet.
+              </div>
+            ) : (
+              planningThreats.map((threat, index) => {
+                const selected = selectedThreatId === threat.id;
+                const label =
+                  threat.kind === "large"
+                    ? "Large enemy threat"
+                    : threat.kind === "small"
+                      ? "Small enemy vehicle"
+                      : "Merchant / friendly";
+                return (
+                  <div
+                    key={threat.id}
+                    className={`border p-2 transition ${
+                      selected
+                        ? "border-rose-300/45 bg-rose-500/15 text-rose-100"
+                        : "border-white/10 bg-black text-neutral-300"
+                    }`}
+                  >
+                    <div className="grid grid-cols-[1fr_auto] gap-2">
+                      <button
+                        className="min-w-0 truncate px-1 py-0.5 text-left text-xs font-semibold text-current hover:bg-white/5"
+                        onClick={() => onSelectedThreatChange(threat.id)}
+                      >
+                        {label} {index + 1}
+                      </button>
+                      <button
+                        className="border border-white/10 bg-neutral-950 px-2 py-1 text-[10px] uppercase tracking-wide text-neutral-300 hover:bg-neutral-900"
+                        onClick={(event) => openActionMenu("threat", threat.id, event)}
+                      >
+                        Actions
+                      </button>
+                    </div>
+                    <div className="mt-1 font-mono text-[10px] uppercase text-neutral-500">
+                      x {threat.point.x.toFixed(0)} / y {threat.point.y.toFixed(0)} / detects in range
                     </div>
                   </div>
                 );
@@ -1371,6 +1438,7 @@ export function MissionControls({
                 if (actionMenu.kind === "area") onSelectedAreaChange(actionMenu.id);
                 if (actionMenu.kind === "base") onSelectedBaseChange(actionMenu.id);
                 if (actionMenu.kind === "nfz") onSelectedNfzChange(actionMenu.id);
+                if (actionMenu.kind === "threat") onSelectedThreatChange(actionMenu.id);
                 closeActionMenu();
               }}
             >
@@ -1408,7 +1476,12 @@ export function MissionControls({
                 <AlertTriangle className="mt-0.5 size-4 shrink-0 text-red-300" />
                 <div>
                   <div className="text-sm font-semibold text-red-100">
-                    Delete {pendingDelete.kind === "nfz" ? "NFZ" : pendingDelete.kind}
+                    Delete{" "}
+                    {pendingDelete.kind === "nfz"
+                      ? "NFZ"
+                      : pendingDelete.kind === "threat"
+                        ? "threat target"
+                        : pendingDelete.kind}
                   </div>
                   <div className="mt-1 text-xs text-neutral-400">
                     You are about to delete{" "}

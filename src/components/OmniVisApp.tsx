@@ -29,11 +29,12 @@ import {
   sendHealthPing,
 } from "@/lib/simulator";
 import {
-  applyThreat,
   applyThreatDecision,
   defaultLoiterForArrivedThreats,
+  detectThreatsInRange,
   nextThreatDecisionTimeS,
   pendingThreatAt,
+  stageThreat,
 } from "@/lib/threats";
 import type {
   BaseWaypointMode,
@@ -45,6 +46,7 @@ import type {
   MissionPlan,
   PlanningArea,
   PlanningNfz,
+  PlanningThreat,
   Point,
   StrikeType,
   ThreatKind,
@@ -56,9 +58,10 @@ type PersistedPlanningState = {
   areas: PlanningArea[];
   homeBases: HomeBase[];
   planningNfzs: PlanningNfz[];
+  planningThreats: PlanningThreat[];
 };
 
-type EditorFeatureKind = "area" | "base" | "nfz" | "waypoint";
+type EditorFeatureKind = "area" | "base" | "nfz" | "waypoint" | "threat";
 
 const STORAGE_KEY = "omnivis.planning-state.v1";
 
@@ -69,6 +72,7 @@ function initialPlanningState(): PersistedPlanningState {
       areas: [],
       homeBases: [],
       planningNfzs: [],
+      planningThreats: [],
     }
   );
 }
@@ -112,6 +116,19 @@ function normalizePlanningNfz(nfz: Partial<PlanningNfz>): PlanningNfz {
     label: typeof nfz.label === "string" ? nfz.label : "NFZ",
     polygon: Array.isArray(nfz.polygon) ? nfz.polygon : [],
     enabled: nfz.enabled !== false,
+  };
+}
+
+function normalizePlanningThreat(threat: Partial<PlanningThreat>): PlanningThreat {
+  const kind = threat.kind === "merchant" || threat.kind === "large" ? threat.kind : "small";
+  const point =
+    threat.point && Number.isFinite(threat.point.x) && Number.isFinite(threat.point.y)
+      ? threat.point
+      : { x: 0, y: 0 };
+  return {
+    id: typeof threat.id === "string" ? threat.id : makeId("threat"),
+    kind,
+    point,
   };
 }
 
@@ -184,6 +201,9 @@ function readPersistedState(): PersistedPlanningState | null {
       areas: (parsed.areas ?? []).map((area) => normalizePlanningArea(area)),
       homeBases: (parsed.homeBases ?? []).map((base) => normalizeHomeBase(base)),
       planningNfzs: (parsed.planningNfzs ?? []).map((nfz) => normalizePlanningNfz(nfz)),
+      planningThreats: (parsed.planningThreats ?? []).map((threat) =>
+        normalizePlanningThreat(threat),
+      ),
     };
   } catch {
     return null;
@@ -200,6 +220,9 @@ export function OmniVisApp() {
   const [areas, setAreas] = useState<PlanningArea[]>(initialState.areas);
   const [homeBases, setHomeBases] = useState<HomeBase[]>(initialState.homeBases);
   const [planningNfzs, setPlanningNfzs] = useState<PlanningNfz[]>(initialState.planningNfzs);
+  const [planningThreats, setPlanningThreats] = useState<PlanningThreat[]>(
+    initialState.planningThreats,
+  );
   const [selectedAreaId, setSelectedAreaId] = useState<string | undefined>(
     initialState.areas[0]?.id,
   );
@@ -208,6 +231,9 @@ export function OmniVisApp() {
   );
   const [selectedNfzId, setSelectedNfzId] = useState<string | undefined>(
     initialState.planningNfzs[0]?.id,
+  );
+  const [selectedThreatId, setSelectedThreatId] = useState<string | undefined>(
+    initialState.planningThreats[0]?.id,
   );
   const [draftPolygon, setDraftPolygon] = useState<Point[]>([]);
   const [plan, setPlan] = useState<MissionPlan | null>(null);
@@ -219,6 +245,7 @@ export function OmniVisApp() {
   const mapPreset = useMemo(() => getMapPreset(config.mapPresetId), [config.mapPresetId]);
   const maxTimeS = useMemo(() => getMissionMaxTime(plan), [plan]);
   const planningNfzsRef = useRef(planningNfzs);
+  const threatScanTimeRef = useRef(0);
 
   useEffect(() => {
     planningNfzsRef.current = planningNfzs;
@@ -230,9 +257,10 @@ export function OmniVisApp() {
       areas,
       homeBases,
       planningNfzs,
+      planningThreats,
     };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-  }, [areas, homeBases, planningNfzs]);
+  }, [areas, homeBases, planningNfzs, planningThreats]);
 
   useEffect(() => {
     if (!isRunning) return;
@@ -253,6 +281,23 @@ export function OmniVisApp() {
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
   }, [isRunning, maxTimeS, playbackRate, plan]);
+
+  useEffect(() => {
+    if (!plan) {
+      threatScanTimeRef.current = simTimeS;
+      return;
+    }
+    const fromTimeS = threatScanTimeRef.current;
+    const toTimeS = simTimeS;
+    threatScanTimeRef.current = toTimeS;
+    if (toTimeS <= fromTimeS + 0.01) return;
+    const detectedPlan = detectThreatsInRange(plan, fromTimeS, toTimeS);
+    if (detectedPlan === plan) return;
+    setPlan(detectedPlan);
+    if (pendingThreatAt(detectedPlan, toTimeS)) {
+      setIsRunning(false);
+    }
+  }, [plan, simTimeS]);
 
   const selectedArea = areas.find((area) => area.id === selectedAreaId);
   const linkedBase = selectedArea?.linkedBaseId
@@ -287,11 +332,14 @@ export function OmniVisApp() {
       .map((nfz, index) =>
         planningNfzToMissionNfz(nfz.label || `NFZ_${index + 1}`, nfz.polygon, simTimeS),
       );
-    const nextPlan = generateMissionPlanFromArea(config, area.polygon, base, nfzs);
+    let nextPlan = generateMissionPlanFromArea(config, area.polygon, base, nfzs);
     const strikeBase = area.strikeBaseId
       ? homeBases.find((candidate) => candidate.id === area.strikeBaseId)
       : undefined;
     nextPlan.strikeBase = strikeBase ? normalizeHomeBase(strikeBase) : undefined;
+    planningThreats.forEach((threat) => {
+      nextPlan = stageThreat(nextPlan, threat.kind, threat.point, 0);
+    });
     if (
       primaryBase &&
       normalizeHomeBase(primaryBase).available === false &&
@@ -309,13 +357,25 @@ export function OmniVisApp() {
       config.commsPolicy === "full_signal" ? lossResponseMode : "dispatch_replacement";
     setPlan(nextPlan);
     setSelectedUavId(nextPlan.uavs[0]?.id);
+    threatScanTimeRef.current = 0;
     setSimTimeS(0);
     setIsRunning(false);
-  }, [areas, config, homeBases, lossResponseMode, planningNfzs, selectedArea, selectedBase, simTimeS]);
+  }, [
+    areas,
+    config,
+    homeBases,
+    lossResponseMode,
+    planningNfzs,
+    planningThreats,
+    selectedArea,
+    selectedBase,
+    simTimeS,
+  ]);
 
   const resetSimulation = useCallback(() => {
     setPlan(null);
     setSelectedUavId(undefined);
+    threatScanTimeRef.current = 0;
     setSimTimeS(0);
     setIsRunning(false);
   }, []);
@@ -345,6 +405,7 @@ export function OmniVisApp() {
     }
     setConfig(normalizedNext);
     setPlan(null);
+    threatScanTimeRef.current = 0;
     setSimTimeS(0);
   };
 
@@ -364,7 +425,21 @@ export function OmniVisApp() {
   const handleMapPoint = (point: Point) => {
     if (editorMode === "place_threat") {
       if (plan) {
-        setPlan(applyThreat(plan, threatKind, point, simTimeS));
+        setPlan(stageThreat(plan, threatKind, point, simTimeS));
+      } else {
+        const nextThreat = {
+          id: makeId("threat"),
+          kind: threatKind,
+          point,
+        };
+        setPlanningThreats((current) => [
+          ...current,
+          nextThreat,
+        ]);
+        setSelectedThreatId(nextThreat.id);
+        setSelectedAreaId(undefined);
+        setSelectedBaseId(undefined);
+        setSelectedNfzId(undefined);
       }
       setEditorMode("select");
       return;
@@ -457,6 +532,7 @@ export function OmniVisApp() {
       setSelectedNfzId(nfz.id);
       setSelectedAreaId(undefined);
       setSelectedBaseId(undefined);
+      setSelectedThreatId(undefined);
     }
     setDraftPolygon([]);
     setEditorMode("select");
@@ -491,6 +567,12 @@ export function OmniVisApp() {
   const deleteNfz = (nfzId: string) => {
     setPlanningNfzs((current) => current.filter((nfz) => nfz.id !== nfzId));
     if (selectedNfzId === nfzId) setSelectedNfzId(undefined);
+    setPlan(null);
+  };
+
+  const deleteThreat = (threatId: string) => {
+    setPlanningThreats((current) => current.filter((threat) => threat.id !== threatId));
+    if (selectedThreatId === threatId) setSelectedThreatId(undefined);
     setPlan(null);
   };
 
@@ -686,9 +768,11 @@ export function OmniVisApp() {
     if (kind === "area") {
       setSelectedAreaId(id);
       setSelectedNfzId(undefined);
+      setSelectedThreatId(undefined);
     } else if (kind === "base") {
       setSelectedBaseId(id);
       setSelectedNfzId(undefined);
+      setSelectedThreatId(undefined);
     } else if (kind === "waypoint") {
       const parentBase = homeBases.find((base) => {
         const normalized = normalizeHomeBase(base);
@@ -701,11 +785,18 @@ export function OmniVisApp() {
         setSelectedBaseId(parentBase.id);
         setSelectedAreaId(undefined);
         setSelectedNfzId(undefined);
+        setSelectedThreatId(undefined);
       }
+    } else if (kind === "threat") {
+      setSelectedThreatId(id);
+      setSelectedAreaId(undefined);
+      setSelectedBaseId(undefined);
+      setSelectedNfzId(undefined);
     } else {
       setSelectedNfzId(id);
       setSelectedAreaId(undefined);
       setSelectedBaseId(undefined);
+      setSelectedThreatId(undefined);
     }
   };
 
@@ -733,6 +824,14 @@ export function OmniVisApp() {
           base.id === id
             ? { ...base, point: { x: base.point.x + delta.x, y: base.point.y + delta.y } }
             : base,
+        ),
+      );
+    } else if (kind === "threat") {
+      setPlanningThreats((current) =>
+        current.map((threat) =>
+          threat.id === id
+            ? { ...threat, point: { x: threat.point.x + delta.x, y: threat.point.y + delta.y } }
+            : threat,
         ),
       );
     } else {
@@ -873,12 +972,14 @@ export function OmniVisApp() {
           areas={areas}
           homeBases={homeBases}
           planningNfzs={planningNfzs}
+          planningThreats={planningThreats}
           selectedAreaId={selectedAreaId}
           selectedBaseId={selectedBaseId}
           selectedNfzId={selectedNfzId}
+          selectedThreatId={selectedThreatId}
           draftPointCount={draftPolygon.length}
           canCompile={canCompile}
-          canDeleteSelected={Boolean(selectedAreaId || selectedBaseId || selectedNfzId)}
+          canDeleteSelected={Boolean(selectedAreaId || selectedBaseId || selectedNfzId || selectedThreatId)}
           canTriggerSelectedLoss={canTriggerSelectedLoss}
           onConfigChange={handleConfigChange}
           onDemoModeChange={handleDemoModeChange}
@@ -886,15 +987,24 @@ export function OmniVisApp() {
           onSelectedAreaChange={(id) => {
             setSelectedAreaId(id);
             setSelectedNfzId(undefined);
+            setSelectedThreatId(undefined);
           }}
           onSelectedBaseChange={(id) => {
             setSelectedBaseId(id);
             setSelectedNfzId(undefined);
+            setSelectedThreatId(undefined);
           }}
           onSelectedNfzChange={(id) => {
             setSelectedNfzId(id);
             setSelectedAreaId(undefined);
             setSelectedBaseId(undefined);
+            setSelectedThreatId(undefined);
+          }}
+          onSelectedThreatChange={(id) => {
+            setSelectedThreatId(id);
+            setSelectedAreaId(undefined);
+            setSelectedBaseId(undefined);
+            setSelectedNfzId(undefined);
           }}
           onFinishPolygon={finishPolygon}
           onCancelDraft={() => {
@@ -914,6 +1024,7 @@ export function OmniVisApp() {
           onDeleteArea={deleteArea}
           onDeleteBase={deleteBase}
           onDeleteNfz={deleteNfz}
+          onDeleteThreat={deleteThreat}
           onToggleNfzEnabled={togglePlanningNfzEnabled}
           onToggleBaseAvailability={toggleSelectedBaseAvailability}
           onAddBaseWaypoint={(direction) =>
@@ -934,6 +1045,7 @@ export function OmniVisApp() {
             areas={areas}
             homeBases={homeBases}
             planningNfzs={planningNfzs}
+            planningThreats={planningThreats}
             draftPolygon={draftPolygon}
             editorMode={editorMode}
             simTimeS={simTimeS}
@@ -941,6 +1053,7 @@ export function OmniVisApp() {
             selectedAreaId={selectedAreaId}
             selectedBaseId={selectedBaseId}
             selectedNfzId={selectedNfzId}
+            selectedThreatId={selectedThreatId}
             onSelectUav={setSelectedUavId}
             onMapPoint={handleMapPoint}
             onSelectEditorFeature={handleSelectEditorFeature}

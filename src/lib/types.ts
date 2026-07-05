@@ -68,6 +68,7 @@ export type ThreatKind = "merchant" | "small" | "large";
 export type StrikeType = "continuous" | "saturation";
 
 export type ThreatPhase =
+  | "undetected"
   | "confirming"
   | "awaiting_decision"
   | "loiter_hold"
@@ -161,6 +162,12 @@ export type PlanningNfz = {
   label: string;
   polygon: Point[];
   enabled?: boolean;
+};
+
+export type PlanningThreat = {
+  id: string;
+  kind: ThreatKind;
+  point: Point;
 };
 
 export type CoverageStrip = {

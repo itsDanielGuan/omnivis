@@ -22,10 +22,11 @@ import type {
   MissionPlan,
   PlanningArea,
   PlanningNfz,
+  PlanningThreat,
   Point,
 } from "@/lib/types";
 
-type EditorFeatureKind = "area" | "base" | "nfz" | "waypoint";
+type EditorFeatureKind = "area" | "base" | "nfz" | "waypoint" | "threat";
 
 type Props = {
   plan: MissionPlan | null;
@@ -33,6 +34,7 @@ type Props = {
   areas: PlanningArea[];
   homeBases: HomeBase[];
   planningNfzs: PlanningNfz[];
+  planningThreats: PlanningThreat[];
   draftPolygon: Point[];
   editorMode: EditorMode;
   simTimeS: number;
@@ -40,6 +42,7 @@ type Props = {
   selectedAreaId?: string;
   selectedBaseId?: string;
   selectedNfzId?: string;
+  selectedThreatId?: string;
   onSelectUav: (uavId: string) => void;
   onMapPoint: (point: Point) => void;
   onSelectEditorFeature: (kind: EditorFeatureKind, id: string) => void;
@@ -72,10 +75,22 @@ function shiftPolygon(polygon: Point[], delta: Point, vertexIndex?: number): Poi
   });
 }
 
+function circlePoints(center: Point, radiusM: number, steps: number): Point[] {
+  return Array.from({ length: steps }, (_, index) => {
+    const angle = (2 * Math.PI * index) / steps;
+    return {
+      x: center.x + Math.cos(angle) * radiusM,
+      y: center.y + Math.sin(angle) * radiusM,
+    };
+  });
+}
+
 const EDITOR_HIT_LAYERS = [
   "editor-vertices",
   "editor-waypoint-hit",
   "editor-waypoint",
+  "editor-threat-hit",
+  "editor-threat-dot",
   "editor-base-hit",
   "editor-base",
   "editor-nfz-fill",
@@ -85,6 +100,7 @@ const EDITOR_HIT_LAYERS = [
 const EDITOR_POPUP_LAYERS = [
   "editor-base-hit",
   "editor-waypoint-hit",
+  "editor-threat-hit",
   "editor-nfz-fill",
   "editor-area-fill",
 ] as const;
@@ -174,21 +190,25 @@ function editorFeatures({
   areas,
   homeBases,
   planningNfzs,
+  planningThreats,
   draftPolygon,
   editorMode,
   selectedAreaId,
   selectedBaseId,
   selectedNfzId,
+  selectedThreatId,
 }: {
   mapPreset: MapPreset;
   areas: PlanningArea[];
   homeBases: HomeBase[];
   planningNfzs: PlanningNfz[];
+  planningThreats: PlanningThreat[];
   draftPolygon: Point[];
   editorMode: EditorMode;
   selectedAreaId?: string;
   selectedBaseId?: string;
   selectedNfzId?: string;
+  selectedThreatId?: string;
 }): Feature[] {
   const features: Feature[] = [];
   const normalizedHomeBases = homeBases.map((base) => normalizeHomeBase(base));
@@ -335,6 +355,40 @@ function editorFeatures({
           selected: nfz.id === selectedNfzId,
         },
       });
+    });
+  });
+
+  planningThreats.forEach((threat) => {
+    const color =
+      threat.kind === "large" ? "#ef4444" : threat.kind === "small" ? "#f97316" : "#f59e0b";
+    const ringRadius = threat.kind === "large" ? 340 : threat.kind === "small" ? 230 : 160;
+    const label =
+      threat.kind === "large" ? "LARGE?" : threat.kind === "small" ? "SMALL?" : "MERCHANT?";
+    features.push({
+      type: "Feature",
+      geometry: {
+        type: "Polygon",
+        coordinates: [closeRing(pointsToLngLat(mapPreset, circlePoints(threat.point, ringRadius, 48)))],
+      },
+      properties: {
+        kind: "planning_threat_ring",
+        entityKind: "threat",
+        id: threat.id,
+        color,
+        selected: threat.id === selectedThreatId,
+      },
+    });
+    features.push({
+      type: "Feature",
+      geometry: { type: "Point", coordinates: toLngLat(mapPreset, threat.point) },
+      properties: {
+        kind: "planning_threat",
+        entityKind: "threat",
+        id: threat.id,
+        label,
+        color,
+        selected: threat.id === selectedThreatId,
+      },
     });
   });
 
@@ -555,6 +609,65 @@ function addMissionLayers(map: MapLibreMap) {
         "line-color": "#fb7185",
         "line-width": ["case", ["==", ["get", "selected"], true], 3, 2],
         "line-opacity": ["case", ["==", ["get", "enabled"], false], 0.28, 0.95],
+      },
+    },
+    {
+      id: "editor-threat-ring-fill",
+      type: "fill",
+      filter: ["==", ["get", "kind"], "planning_threat_ring"],
+      paint: {
+        "fill-color": ["get", "color"],
+        "fill-opacity": ["case", ["==", ["get", "selected"], true], 0.16, 0.08],
+      },
+    },
+    {
+      id: "editor-threat-ring-line",
+      type: "line",
+      filter: ["==", ["get", "kind"], "planning_threat_ring"],
+      paint: {
+        "line-color": ["get", "color"],
+        "line-width": ["case", ["==", ["get", "selected"], true], 2.4, 1.4],
+        "line-opacity": ["case", ["==", ["get", "selected"], true], 0.95, 0.78],
+        "line-dasharray": [2, 2],
+      },
+    },
+    {
+      id: "editor-threat-dot",
+      type: "circle",
+      filter: ["==", ["get", "kind"], "planning_threat"],
+      paint: {
+        "circle-radius": ["case", ["==", ["get", "selected"], true], 9, 7],
+        "circle-color": ["get", "color"],
+        "circle-opacity": 0.88,
+        "circle-stroke-color": "#050505",
+        "circle-stroke-width": 1.5,
+      },
+    },
+    {
+      id: "editor-threat-hit",
+      type: "circle",
+      filter: ["==", ["get", "kind"], "planning_threat"],
+      paint: {
+        "circle-radius": 18,
+        "circle-color": "#ffffff",
+        "circle-opacity": 0,
+      },
+    },
+    {
+      id: "editor-threat-label",
+      type: "symbol",
+      filter: ["==", ["get", "kind"], "planning_threat"],
+      layout: {
+        "text-field": ["get", "label"],
+        "text-size": 10,
+        "text-offset": [0, 1.4],
+        "text-anchor": "top",
+        "text-allow-overlap": true,
+      },
+      paint: {
+        "text-color": ["get", "color"],
+        "text-halo-color": "#000000",
+        "text-halo-width": 1.4,
       },
     },
     {
@@ -982,6 +1095,7 @@ export function MapMissionView({
   areas,
   homeBases,
   planningNfzs,
+  planningThreats,
   draftPolygon,
   editorMode,
   simTimeS,
@@ -989,6 +1103,7 @@ export function MapMissionView({
   selectedAreaId,
   selectedBaseId,
   selectedNfzId,
+  selectedThreatId,
   onSelectUav,
   onMapPoint,
   onSelectEditorFeature,
@@ -1002,13 +1117,14 @@ export function MapMissionView({
   const nfzMarkersRef = useRef<Array<{ remove: () => void }>>([]);
   const popupRef = useRef<MapLibrePopup | null>(null);
   const popupSuppressedUntilRef = useRef(0);
-  const editorDataRef = useRef({ areas, homeBases, planningNfzs });
+  const editorDataRef = useRef({ areas, homeBases, planningNfzs, planningThreats });
   const editorViewRef = useRef({
     draftPolygon,
     editorMode,
     selectedAreaId,
     selectedBaseId,
     selectedNfzId,
+    selectedThreatId,
   });
   const callbacksRef = useRef({
     onSelectUav,
@@ -1035,8 +1151,8 @@ export function MapMissionView({
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
-    editorDataRef.current = { areas, homeBases, planningNfzs };
-  }, [areas, homeBases, planningNfzs]);
+    editorDataRef.current = { areas, homeBases, planningNfzs, planningThreats };
+  }, [areas, homeBases, planningNfzs, planningThreats]);
 
   useEffect(() => {
     editorViewRef.current = {
@@ -1045,8 +1161,9 @@ export function MapMissionView({
       selectedAreaId,
       selectedBaseId,
       selectedNfzId,
+      selectedThreatId,
     };
-  }, [draftPolygon, editorMode, selectedAreaId, selectedBaseId, selectedNfzId]);
+  }, [draftPolygon, editorMode, selectedAreaId, selectedBaseId, selectedNfzId, selectedThreatId]);
 
   useEffect(() => {
     callbacksRef.current = {
@@ -1078,11 +1195,13 @@ export function MapMissionView({
         areas,
         homeBases,
         planningNfzs,
+        planningThreats: plan ? [] : planningThreats,
         draftPolygon,
         editorMode,
         selectedAreaId,
         selectedBaseId,
         selectedNfzId,
+        selectedThreatId,
       }),
     }),
     [
@@ -1091,11 +1210,13 @@ export function MapMissionView({
       editorMode,
       homeBases,
       mapPreset,
-      plan?.mapPreset,
+      plan,
       planningNfzs,
+      planningThreats,
       selectedAreaId,
       selectedBaseId,
       selectedNfzId,
+      selectedThreatId,
     ],
   );
 
@@ -1221,6 +1342,7 @@ export function MapMissionView({
         areas: latestAreas,
         homeBases: latestHomeBases,
         planningNfzs: latestPlanningNfzs,
+        planningThreats: latestPlanningThreats,
       } = editorDataRef.current;
       if (kind === "planning_area") {
         const area = latestAreas.find((candidate) => candidate.id === id);
@@ -1270,6 +1392,22 @@ export function MapMissionView({
           detail: nfz?.enabled === false ? "Disabled polygon" : "Active restricted polygon",
         };
       }
+      if (kind === "planning_threat") {
+        const threat = latestPlanningThreats.find((candidate) => candidate.id === id);
+        const threatLabel =
+          threat?.kind === "large"
+            ? "Large enemy threat"
+            : threat?.kind === "small"
+              ? "Small enemy vehicle"
+              : "Merchant / friendly";
+        return {
+          kind: "Threat target",
+          label: threatLabel,
+          detail: threat
+            ? `Local ${threat.point.x.toFixed(0)}, ${threat.point.y.toFixed(0)}; drag to move`
+            : "Drag to move",
+        };
+      }
       if (kind === "base_waypoint") {
         return {
           kind: String(props.direction ?? "") === "outbound" ? "Outbound waypoint" : "Inbound waypoint",
@@ -1289,7 +1427,12 @@ export function MapMissionView({
 
     const previewNfzDrag = (drag: NonNullable<typeof dragRef.current>) => {
       if (drag.kind !== "nfz" || !drag.originalPolygon) return;
-      const { areas: latestAreas, homeBases: latestHomeBases, planningNfzs: latestPlanningNfzs } =
+      const {
+        areas: latestAreas,
+        homeBases: latestHomeBases,
+        planningNfzs: latestPlanningNfzs,
+        planningThreats: latestPlanningThreats,
+      } =
         editorDataRef.current;
       const {
         draftPolygon: latestDraftPolygon,
@@ -1297,6 +1440,7 @@ export function MapMissionView({
         selectedAreaId: latestSelectedAreaId,
         selectedBaseId: latestSelectedBaseId,
         selectedNfzId: latestSelectedNfzId,
+        selectedThreatId: latestSelectedThreatId,
       } = editorViewRef.current;
       const source = map.getSource("editor") as GeoJSONSource | undefined;
       const previewNfzs = latestPlanningNfzs.map((nfz) =>
@@ -1314,11 +1458,13 @@ export function MapMissionView({
           areas: latestAreas,
           homeBases: latestHomeBases,
           planningNfzs: previewNfzs,
+          planningThreats: latestPlanningThreats,
           draftPolygon: latestDraftPolygon,
           editorMode: latestEditorMode,
           selectedAreaId: latestSelectedAreaId,
           selectedBaseId: latestSelectedBaseId,
           selectedNfzId: latestSelectedNfzId,
+          selectedThreatId: latestSelectedThreatId,
         }),
       });
     };
@@ -1539,7 +1685,8 @@ export function MapMissionView({
       editorMode === "draw_nfz" ||
       editorMode === "place_base" ||
       editorMode === "place_outbound_waypoint" ||
-      editorMode === "place_inbound_waypoint"
+      editorMode === "place_inbound_waypoint" ||
+      editorMode === "place_threat"
     ) {
       map.getCanvas().style.cursor = "crosshair";
     } else if (!dragRef.current) {
@@ -1590,7 +1737,8 @@ export function MapMissionView({
       editorMode === "draw_nfz" ||
       editorMode === "place_base" ||
       editorMode === "place_outbound_waypoint" ||
-      editorMode === "place_inbound_waypoint"
+      editorMode === "place_inbound_waypoint" ||
+      editorMode === "place_threat"
     ) {
       map.getCanvas().style.cursor = "crosshair";
     } else if (!dragRef.current) {

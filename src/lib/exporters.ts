@@ -117,6 +117,31 @@ function buildReadme(plan: MissionPlan): MissionArtifact {
   };
 }
 
+function threatTargetsForExport(plan: MissionPlan) {
+  return plan.threats.map((threat) => {
+    const geo = localMetersToLatLon(
+      plan.mapPreset.baseLat,
+      plan.mapPreset.baseLon,
+      threat.point,
+    );
+    return {
+      id: threat.id,
+      kind: threat.kind,
+      phase: threat.phase,
+      localM: threat.point,
+      lat: geo.lat,
+      lon: geo.lon,
+      createdAtS: threat.createdAtS,
+      detectedByUavId: threat.detectedByUavId,
+      detectedAtS: threat.detectedAtS,
+      confirmUavId: threat.confirmUavId,
+      confirmArrivalS: threat.confirmArrivalS,
+      resolvedAtS: threat.resolvedAtS,
+      strike: threat.strike,
+    };
+  });
+}
+
 export function buildMissionArtifacts(plan: MissionPlan): MissionArtifact[] {
   const initialInfill =
     plan.config.initialInfillPattern ?? plan.config.pathPattern ?? "rectilinear";
@@ -165,6 +190,7 @@ export function buildMissionArtifacts(plan: MissionPlan): MissionArtifact[] {
       start: strip.start,
       end: strip.end,
     })),
+    threatTargets: threatTargetsForExport(plan),
   };
 
   const contingencyPolicy = {
@@ -209,6 +235,11 @@ export function buildMissionArtifacts(plan: MissionPlan): MissionArtifact[] {
 
   return [
     jsonArtifact("mission_contract.json", missionContract),
+    jsonArtifact("threat_targets.json", {
+      schema: "omnivis.threat_targets.v1",
+      missionId: plan.id,
+      targets: threatTargetsForExport(plan),
+    }),
     jsonArtifact("contingency_policy.json", contingencyPolicy),
     jsonArtifact("metrics.json", plan.metrics),
     jsonArtifact("simulation_trace.json", trace),
