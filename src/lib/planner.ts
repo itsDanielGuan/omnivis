@@ -1,7 +1,11 @@
 import {
   bounds,
+  clipPolygonToXSlab,
+  clipPolygonToYSlab,
   distance,
   horizontalLinePolygonIntersections,
+  insetPolygon,
+  lerpPoint,
   midpoint,
   pointInPolygon,
   polygonApproxRadius,
@@ -60,6 +64,7 @@ function waypoint(
 const INFILL_PATTERN_IDS: InfillPattern[] = [
   "rectilinear",
   "zigzag",
+  "spiral",
   "grid",
   "triangles",
   "tri_hex",
@@ -80,6 +85,7 @@ export function normalizeInfillPattern(value?: string): InfillPattern {
   if (INFILL_PATTERN_IDS.includes(value as InfillPattern)) return value as InfillPattern;
   if (value === "sector_lanes") return "rectilinear";
   if (value === "alternating_lanes") return "zigzag";
+  if (value === "sector_edge_spiral") return "spiral";
   if (value === "sector_edge_sweep") return "chevron";
   if (value === "center_out_sweep") return "diamond";
   if (value === "nearest_infill") return "lightning";
@@ -198,11 +204,110 @@ function generateCoverageStripsForPass(
   return strips;
 }
 
+function concentricRings(aoo: Point[], spacing: number): Point[][] {
+  const rings: Point[][] = [];
+  // First ring sits half a swath inside the boundary; subsequent rings step
+  // inward by the lane spacing. Offsetting the original polygon by a growing
+  // cumulative distance avoids error accumulation from iterative insetting.
+  // Keep stepping inward until the sector genuinely collapses so the spiral
+  // reaches the center rather than leaving an empty core.
+  for (let inset = spacing / 2, guard = 0; guard < 600; inset += spacing, guard += 1) {
+    const ring = insetPolygon(aoo, inset);
+    if (!ring || ring.length < 3) break;
+    rings.push(ring);
+  }
+  return rings;
+}
+
+/**
+ * Partition the area of operations into one compact cell per drone, arranged as
+ * a near-square grid (in the strip-angle frame). Compact cells — rather than
+ * thin full-width bands — give each drone room to spiral concentric rings all
+ * the way to its own center.
+ */
+function sectorCells(aoo: Point[], config: MissionConfig): { poly: Point[]; uavId: string }[] {
+  const count = Math.max(1, config.uavCount);
+  const angle = (config.stripAngleDeg * Math.PI) / 180;
+  const rotated = aoo.map((point) => rotatePoint(point, -angle));
+  const box = bounds(rotated);
+  const cols = Math.ceil(Math.sqrt(count));
+  const baseRows = Math.floor(count / cols);
+  const extraRows = count % cols;
+  const colWidth = (box.maxX - box.minX) / cols;
+  const cells: { poly: Point[]; uavId: string }[] = [];
+  let drone = 0;
+
+  for (let col = 0; col < cols; col += 1) {
+    const rowsInCol = baseRows + (col < extraRows ? 1 : 0);
+    if (rowsInCol <= 0) continue;
+    const x0 = box.minX + col * colWidth;
+    const x1 = col === cols - 1 ? box.maxX : x0 + colWidth;
+    const columnRotated = clipPolygonToXSlab(rotated, x0, x1);
+    const rowHeight = (box.maxY - box.minY) / rowsInCol;
+
+    for (let row = 0; row < rowsInCol; row += 1) {
+      const y0 = box.minY + row * rowHeight;
+      const y1 = row === rowsInCol - 1 ? box.maxY : y0 + rowHeight;
+      const cellRotated = clipPolygonToYSlab(columnRotated, y0, y1);
+      if (cellRotated.length >= 3) {
+        cells.push({
+          poly: cellRotated.map((point) => rotatePoint(point, angle)),
+          uavId: `UAV_${drone + 1}`,
+        });
+      }
+      drone += 1;
+    }
+  }
+
+  return cells;
+}
+
+function generateConcentricRingStrips(
+  aoo: Point[],
+  config: MissionConfig,
+): CoverageStrip[] {
+  const spacing = Math.max(40, config.sensorSwathM * (1 - config.overlapRatio));
+  const maxSegmentM = Math.max(config.sensorSwathM * 3, 260);
+  const strips: CoverageStrip[] = [];
+  let order = 0;
+
+  sectorCells(aoo, config).forEach(({ poly, uavId }) => {
+    concentricRings(poly, spacing).forEach((ring, ringIndex) => {
+      for (let i = 0; i < ring.length; i += 1) {
+        const a = ring[i];
+        const b = ring[(i + 1) % ring.length];
+        const parts = Math.max(1, Math.ceil(distance(a, b) / maxSegmentM));
+        for (let p = 0; p < parts; p += 1) {
+          const start = lerpPoint(a, b, p / parts);
+          const end = lerpPoint(a, b, (p + 1) / parts);
+          strips.push({
+            id: `S_${String(order + 1).padStart(2, "0")}`,
+            order,
+            start,
+            end,
+            center: midpoint(start, end),
+            polygon: stripPolygon(start, end, config.sensorSwathM / 2),
+            assignedUavId: uavId,
+            status: "planned",
+            infillPattern: "spiral",
+            infillPass: ringIndex,
+          });
+          order += 1;
+        }
+      }
+    });
+  });
+
+  return strips;
+}
+
 export function generateCoverageStrips(
   aoo: Point[],
   config: MissionConfig,
   pattern: InfillPattern = initialInfillPattern(config),
 ): CoverageStrip[] {
+  if (pattern === "spiral") return generateConcentricRingStrips(aoo, config);
+
   const strips: CoverageStrip[] = [];
   infillPasses(pattern).forEach((pass, passIndex) => {
     strips.push(
@@ -220,9 +325,37 @@ export function generateCoverageStrips(
   return strips;
 }
 
-function assignStrips(strips: CoverageStrip[], config: MissionConfig): CoverageStrip[] {
+export function generateRecoveryStrips(
+  aoo: Point[],
+  config: MissionConfig,
+  pattern: InfillPattern,
+  coveredCenters: Point[],
+): CoverageStrip[] {
+  const generated = assignStripsToPattern(
+    generateCoverageStrips(aoo, config, pattern),
+    config,
+    pattern,
+  );
+  const matchRadius = Math.max(40, config.sensorSwathM * 0.55);
+  return generated.filter(
+    (candidate) =>
+      !coveredCenters.some((center) => distance(center, candidate.center) < matchRadius),
+  );
+}
+
+export function assignStripsToPattern(
+  strips: CoverageStrip[],
+  config: MissionConfig,
+  pattern: InfillPattern = initialInfillPattern(config),
+): CoverageStrip[] {
   const ordered = [...strips].sort((a, b) => a.order - b.order);
-  const pattern = initialInfillPattern(config);
+
+  if (pattern === "spiral") {
+    // Spiral strips are already partitioned into one contiguous band (sector)
+    // per drone at generation time, each with its own concentric-ring spiral.
+    return ordered;
+  }
+
   const interleavedPatterns: InfillPattern[] = [
     "grid",
     "triangles",
@@ -247,6 +380,45 @@ function assignStrips(strips: CoverageStrip[], config: MissionConfig): CoverageS
       assignedUavId: `UAV_${contiguousSector + 1}`,
     };
   });
+}
+
+function assignStrips(strips: CoverageStrip[], config: MissionConfig): CoverageStrip[] {
+  return assignStripsToPattern(strips, config, initialInfillPattern(config));
+}
+
+function stripTraversalForPattern(
+  cursor: Point,
+  strip: CoverageStrip,
+  nfzs: Nfz[],
+  uavIndex: number,
+  pattern: InfillPattern,
+  stripIndex: number,
+  homeBase?: HomeBase,
+) {
+  const forward = { entry: strip.start, exit: strip.end };
+  const reverse = { entry: strip.end, exit: strip.start };
+  let preferred = forward;
+
+  if (pattern === "rectilinear") {
+    preferred = stripIndex % 2 === 0 ? forward : reverse;
+  } else if (pattern === "zigzag") {
+    preferred = uavIndex % 2 === 0 ? forward : reverse;
+  } else {
+    return bestStripTraversal(cursor, strip, nfzs, uavIndex, homeBase);
+  }
+
+  const transitCostM = safePathLength(cursor, preferred.entry, nfzs, uavIndex);
+  const coverageCostM = safePathLength(preferred.entry, preferred.exit, nfzs, uavIndex);
+  const returnCostM = homeBase
+    ? safePathLength(preferred.exit, homeBase.point, nfzs, uavIndex)
+    : 0;
+  return {
+    ...preferred,
+    transitCostM,
+    coverageCostM,
+    returnCostM,
+    totalCostM: transitCostM + coverageCostM + returnCostM,
+  };
 }
 
 function stripTraverseCost(
@@ -362,6 +534,28 @@ function edgeFirstOrder(strips: CoverageStrip[], uavIndex: number): CoverageStri
   return result;
 }
 
+function spiralOrder(strips: CoverageStrip[]): CoverageStrip[] {
+  // Concentric rings: cover the outermost ring first, then wind inward. Ring
+  // arcs are walked in a serpentine (alternating) direction so the end of one
+  // ring connects to the start of the next, forming a continuous inward spiral.
+  const byRing = new Map<number, CoverageStrip[]>();
+  strips.forEach((strip) => {
+    const ring = strip.infillPass ?? 0;
+    byRing.set(ring, [...(byRing.get(ring) ?? []), strip]);
+  });
+
+  const result: CoverageStrip[] = [];
+  [...byRing.keys()]
+    .sort((a, b) => a - b)
+    .forEach((ring, index) => {
+      const arc = (byRing.get(ring) ?? []).sort((a, b) => a.order - b.order);
+      if (index % 2 === 1) arc.reverse();
+      result.push(...arc);
+    });
+
+  return result;
+}
+
 function centerOutOrder(strips: CoverageStrip[], uavIndex: number): CoverageStrip[] {
   const ordered = [...strips].sort((a, b) => a.order - b.order);
   const center = (ordered.length - 1) / 2;
@@ -439,9 +633,7 @@ export function orderCoverageStripsForInfillPattern(
 ): CoverageStrip[] {
   const ordered = [...strips].sort((a, b) => a.order - b.order);
 
-  if (pattern === "zigzag") {
-    return uavIndex % 2 === 0 ? ordered : ordered.reverse();
-  }
+  if (pattern === "spiral") return spiralOrder(ordered);
 
   if (pattern === "chevron") return edgeFirstOrder(ordered, uavIndex);
 
@@ -505,7 +697,15 @@ function buildCoverageRoute(
 
   orderedStrips.forEach((strip, idx) => {
     let current = route[route.length - 1];
-    let traversal = bestStripTraversal(current, strip, nfzs, uavIndex, homeBase);
+    let traversal = stripTraversalForPattern(
+      current,
+      strip,
+      nfzs,
+      uavIndex,
+      pattern,
+      idx,
+      homeBase,
+    );
     let entry = traversal.entry;
     let exit = traversal.exit;
     if (homeBase) {
@@ -532,7 +732,15 @@ function buildCoverageRoute(
         current = route[route.length - 1];
       }
 
-      traversal = bestStripTraversal(current, strip, nfzs, uavIndex, homeBase);
+      traversal = stripTraversalForPattern(
+        current,
+        strip,
+        nfzs,
+        uavIndex,
+        pattern,
+        idx,
+        homeBase,
+      );
       entry = traversal.entry;
       exit = traversal.exit;
       const freshRequiredS = traversal.totalCostM / config.speedMps;

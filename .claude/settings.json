@@ -4,7 +4,14 @@
       "Bash(npx tsc *)",
       "Bash(grep -iE \"^tsx$|^ts-node$|esbuild\")",
       "Bash(node -e \"console.log\\(require\\('./tsconfig.json'\\).compilerOptions.paths\\)\")",
-      "Bash(npx --yes tsx@4 \"C:/Users/danie/AppData/Local/Temp/claude/c--projects-omnivisproject-omnivis/f93ff591-f2ae-46a7-97c7-894bf8cec7c1/scratchpad/threat-smoke.ts\")"
+      "Bash(npx --yes tsx@4 \"C:/Users/danie/AppData/Local/Temp/claude/c--projects-omnivisproject-omnivis/f93ff591-f2ae-46a7-97c7-894bf8cec7c1/scratchpad/threat-smoke.ts\")",
+      "Bash(npx --yes tsx --tsconfig tsconfig.json \"C:/Users/danie/AppData/Local/Temp/claude/c--projects-omnivisproject-omnivis/53a9f471-b60f-466d-8d27-f099a2fa7540/scratchpad/spiral-check.ts\")",
+      "Bash(npx --yes tsx --tsconfig tsconfig.json \"C:/Users/danie/AppData/Local/Temp/claude/c--projects-omnivisproject-omnivis/53a9f471-b60f-466d-8d27-f099a2fa7540/scratchpad/inset-check.ts\")",
+      "Bash(npx --yes tsx --tsconfig tsconfig.json \"C:/Users/danie/AppData/Local/Temp/claude/c--projects-omnivisproject-omnivis/53a9f471-b60f-466d-8d27-f099a2fa7540/scratchpad/plan-check.ts\")",
+      "Bash(npx eslint *)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\danie\\AppData\\Local\\Temp\\claude\\c--projects-omnivisproject-omnivis\\53a9f471-b60f-466d-8d27-f099a2fa7540\\scratchpad"
     ]
   }
 }

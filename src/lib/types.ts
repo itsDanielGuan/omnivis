@@ -24,6 +24,7 @@ export type CommsPolicy = "silent_operation" | "full_signal";
 export type InfillPattern =
   | "rectilinear"
   | "zigzag"
+  | "spiral"
   | "grid"
   | "triangles"
   | "tri_hex"

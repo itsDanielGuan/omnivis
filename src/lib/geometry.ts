@@ -174,6 +174,120 @@ export function segmentIntersectsCircle(
   return segmentDistanceToPoint(a, b, center) <= radius;
 }
 
+function clipPolygonAgainstY(poly: Point[], y: number, keepGreater: boolean): Point[] {
+  if (poly.length === 0) return poly;
+  const inside = (p: Point) => (keepGreater ? p.y >= y : p.y <= y);
+  const out: Point[] = [];
+  for (let i = 0; i < poly.length; i += 1) {
+    const cur = poly[i];
+    const next = poly[(i + 1) % poly.length];
+    const curIn = inside(cur);
+    const nextIn = inside(next);
+    if (curIn) out.push(cur);
+    if (curIn !== nextIn) {
+      const t = (y - cur.y) / (next.y - cur.y);
+      out.push({ x: cur.x + t * (next.x - cur.x), y });
+    }
+  }
+  return out;
+}
+
+/**
+ * Clip a polygon to the horizontal slab `minY <= y <= maxY` (Sutherland–Hodgman
+ * against the two boundary lines). Used to split an area of operations into
+ * contiguous per-drone bands. Reliable for convex / mildly concave polygons.
+ */
+export function clipPolygonToYSlab(poly: Point[], minY: number, maxY: number): Point[] {
+  return clipPolygonAgainstY(clipPolygonAgainstY(poly, minY, true), maxY, false);
+}
+
+function clipPolygonAgainstX(poly: Point[], x: number, keepGreater: boolean): Point[] {
+  if (poly.length === 0) return poly;
+  const inside = (p: Point) => (keepGreater ? p.x >= x : p.x <= x);
+  const out: Point[] = [];
+  for (let i = 0; i < poly.length; i += 1) {
+    const cur = poly[i];
+    const next = poly[(i + 1) % poly.length];
+    const curIn = inside(cur);
+    const nextIn = inside(next);
+    if (curIn) out.push(cur);
+    if (curIn !== nextIn) {
+      const t = (x - cur.x) / (next.x - cur.x);
+      out.push({ x, y: cur.y + t * (next.y - cur.y) });
+    }
+  }
+  return out;
+}
+
+/** Clip a polygon to the vertical slab `minX <= x <= maxX`. */
+export function clipPolygonToXSlab(poly: Point[], minX: number, maxX: number): Point[] {
+  return clipPolygonAgainstX(clipPolygonAgainstX(poly, minX, true), maxX, false);
+}
+
+function clipPolygonHalfPlane(poly: Point[], point: Point, normal: Point): Point[] {
+  if (poly.length === 0) return poly;
+  const inside = (p: Point) =>
+    (p.x - point.x) * normal.x + (p.y - point.y) * normal.y >= 0;
+  const out: Point[] = [];
+  for (let i = 0; i < poly.length; i += 1) {
+    const cur = poly[i];
+    const next = poly[(i + 1) % poly.length];
+    const curIn = inside(cur);
+    const nextIn = inside(next);
+    if (curIn) out.push(cur);
+    if (curIn !== nextIn) {
+      const dx = next.x - cur.x;
+      const dy = next.y - cur.y;
+      const denom = dx * normal.x + dy * normal.y;
+      if (Math.abs(denom) > 1e-12) {
+        const t =
+          ((point.x - cur.x) * normal.x + (point.y - cur.y) * normal.y) / denom;
+        out.push({ x: cur.x + dx * t, y: cur.y + dy * t });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Shrink a polygon inward by `distanceM` meters. Computed as the intersection of
+ * each edge's half-plane pushed inward (toward the centroid) by `distanceM`,
+ * evaluated by successively clipping the polygon against those moved edges.
+ *
+ * This is the exact inward offset for convex polygons and, crucially, handles
+ * edges collapsing as the shape shrinks — so a spiral of rings keeps stepping
+ * inward until the region genuinely vanishes rather than stopping at the first
+ * edge event. Returns `null` once the region degenerates to nothing.
+ */
+export function insetPolygon(poly: Point[], distanceM: number): Point[] | null {
+  const n = poly.length;
+  if (n < 3) return null;
+  const centroid = polygonCentroid(poly);
+  let result = poly.map((p) => ({ x: p.x, y: p.y }));
+
+  for (let i = 0; i < n; i += 1) {
+    const a = poly[i];
+    const b = poly[(i + 1) % n];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    let nx = -dy / len;
+    let ny = dx / len;
+    const mx = (a.x + b.x) / 2;
+    const my = (a.y + b.y) / 2;
+    // Point the normal toward the interior (centroid), then move the edge in.
+    if ((centroid.x - mx) * nx + (centroid.y - my) * ny < 0) {
+      nx = -nx;
+      ny = -ny;
+    }
+    const movedPoint = { x: a.x + nx * distanceM, y: a.y + ny * distanceM };
+    result = clipPolygonHalfPlane(result, movedPoint, { x: nx, y: ny });
+    if (result.length < 3) return null;
+  }
+
+  return polygonArea(result) < 1 ? null : result;
+}
+
 export function stripPolygon(start: Point, end: Point, halfWidth: number): Point[] {
   const dx = end.x - start.x;
   const dy = end.y - start.y;

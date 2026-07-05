@@ -157,19 +157,30 @@ const INFILL_PATTERN_OPTIONS: Array<{
     id: "rectilinear",
     label: "Rectilinear",
     shortLabel: "Lines",
-    description: "Parallel passes at the configured strip angle.",
-    contingency: "Keeps unfinished work in predictable lane blocks.",
+    description: "Parallel lane passes with S-shaped serpentine turns within each sector.",
+    contingency: "Same pattern keeps unfinished lane work; active UAVs continue uncompleted paths.",
     stroke: "#38bdf8",
-    routes: ["M18 24 H118 M18 38 H118 M18 52 H118 M18 66 H118"],
+    routes: ["M18 24 H118 L118 38 H18 L18 52 H118 L118 66 H18"],
   },
   {
     id: "zigzag",
     label: "Zigzag",
     shortLabel: "Zigzag",
-    description: "Serpentine lane sequencing reduces long deadhead turns.",
-    contingency: "Useful when debt should be consumed as a continuous back-and-forth path.",
+    description: "Parallel lane passes with Z-shaped row returns within each sector.",
+    contingency: "Different pattern triggers full-area recovery with a new approach axis.",
     stroke: "#f59e0b",
     routes: ["M18 24 H118 L18 38 H118 L18 52 H118 L18 66 H118"],
+  },
+  {
+    id: "spiral",
+    label: "Spiral",
+    shortLabel: "Spiral",
+    description: "Splits the area into one compact cell per drone; each drone spirals concentric rings inward to the center of its own sector.",
+    contingency: "Keeps sector work; active UAVs continue inward through remaining rings.",
+    stroke: "#c084fc",
+    routes: [
+      "M26 24 H62 V44 H26 Z M34 30 H54 V38 H34 Z M74 24 H110 V44 H74 Z M82 30 H102 V38 H82 Z M26 50 H62 V70 H26 Z M34 56 H54 V64 H34 Z M74 50 H110 V70 H74 Z M82 56 H102 V64 H82 Z",
+    ],
   },
   {
     id: "grid",
@@ -1355,7 +1366,9 @@ export function MissionControls({
             : "Silent operation: only alive/health signals are assumed, so a loss redoes the assigned sector from base."}
           <span className="mt-1 block text-neutral-500">
             {spreadUsesContingency
-              ? contingencyInfillOption.contingency
+              ? initialInfillPattern === contingencyInfillPattern
+                ? "Matching infill: spread keeps each UAV on its uncompleted paths and only absorbs lost-sector debt."
+                : `Different infill: spread replans the remaining area with ${infillLabel(contingencyInfillPattern)} to recover coverage and vary approach.`
               : `Replacement launches from the active base and uses ${infillLabel(contingencyInfillPattern)} for inherited work.`}
           </span>
         </div>

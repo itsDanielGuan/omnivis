@@ -15,6 +15,8 @@ import { UAV_COLORS } from "@/lib/presets";
 import {
   buildRouteFromStart,
   contingencyInfillPattern,
+  generateRecoveryStrips,
+  initialInfillPattern,
   generateMissionPlanFromArea,
 } from "@/lib/planner";
 import {
@@ -465,6 +467,147 @@ function redistributeRemainingStripsInterleaved(
   return buckets;
 }
 
+function assignRemainingStripsToActiveUavs(
+  plan: MissionPlan,
+  activeUavs: UavPlan[],
+  pattern: InfillPattern,
+  remaining: CoverageStrip[],
+): Map<string, CoverageStrip[]> {
+  if (activeUavs.length === 0) return new Map();
+
+  const activeIds = new Set(activeUavs.map((uav) => uav.id));
+  const ordered = [...remaining].sort((a, b) => a.order - b.order);
+
+  if (pattern === "lightning" || pattern === "triangles" || pattern === "tri_hex") {
+    const buckets = activeUavs.map((uav, index) => ({
+      uav,
+      index,
+      cursor: uav.route.at(-1) ?? plan.homeBase.point,
+      workloadM: 0,
+      strips: [] as CoverageStrip[],
+    }));
+
+    ordered.forEach((strip) => {
+      const best = buckets.reduce((winner, bucket) => {
+        const candidate = stripTraverseFrom(bucket.cursor, strip, plan, bucket.index);
+        const candidateScore =
+          bucket.workloadM + candidate.cost + bucket.strips.length * plan.config.sensorSwathM * 4;
+        const winnerCandidate = stripTraverseFrom(winner.cursor, strip, plan, winner.index);
+        const winnerScore =
+          winner.workloadM +
+          winnerCandidate.cost +
+          winner.strips.length * plan.config.sensorSwathM * 4;
+        return candidateScore < winnerScore ? bucket : winner;
+      }, buckets[0]);
+      if (!best) return;
+
+      const traversal = stripTraverseFrom(best.cursor, strip, plan, best.index);
+      const mutableStrip = plan.strips.find((candidate) => candidate.id === strip.id);
+      if (mutableStrip && activeIds.has(best.uav.id)) {
+        mutableStrip.status = "planned";
+        mutableStrip.assignedUavId = best.uav.id;
+        best.strips.push(mutableStrip);
+        best.cursor = traversal.exit;
+        best.workloadM += traversal.cost;
+      }
+    });
+
+    return new Map(buckets.map((bucket) => [bucket.uav.id, bucket.strips]));
+  }
+
+  if (pattern === "grid" || pattern === "crosshatch" || pattern === "lattice") {
+    const buckets = new Map<string, CoverageStrip[]>(
+      activeUavs.map((uav) => [uav.id, []]),
+    );
+    ordered.forEach((strip, index) => {
+      const owner = activeUavs[index % activeUavs.length];
+      const mutableStrip = plan.strips.find((candidate) => candidate.id === strip.id);
+      if (!owner || !mutableStrip) return;
+      mutableStrip.status = "planned";
+      mutableStrip.assignedUavId = owner.id;
+      buckets.get(owner.id)?.push(mutableStrip);
+    });
+    return buckets;
+  }
+
+  const sectorSize = Math.max(1, Math.ceil(ordered.length / activeUavs.length));
+  const buckets = new Map<string, CoverageStrip[]>(
+    activeUavs.map((uav) => [uav.id, []]),
+  );
+  ordered.forEach((strip, index) => {
+    const owner = activeUavs[Math.min(activeUavs.length - 1, Math.floor(index / sectorSize))];
+    const mutableStrip = plan.strips.find((candidate) => candidate.id === strip.id);
+    if (!owner || !mutableStrip) return;
+    mutableStrip.status = "planned";
+    mutableStrip.assignedUavId = owner.id;
+    buckets.get(owner.id)?.push(mutableStrip);
+  });
+  return buckets;
+}
+
+function redistributeLostDebtOnly(
+  plan: MissionPlan,
+  sourcePlan: MissionPlan,
+  activeUavs: UavPlan[],
+  failedUavId: string,
+  timeS: number,
+): Map<string, CoverageStrip[]> {
+  if (activeUavs.length === 0) return new Map();
+
+  const buckets = new Map<string, CoverageStrip[]>(
+    activeUavs.map((uav) => [uav.id, pendingAssignedStrips(plan, uav, timeS)]),
+  );
+  const lostDebt = unfinishedRedistributionStrips(plan, sourcePlan, timeS).filter(
+    (strip) => strip.assignedUavId === failedUavId,
+  );
+  const sectorSize = Math.max(1, Math.ceil(lostDebt.length / activeUavs.length));
+
+  lostDebt.forEach((strip, index) => {
+    const owner = activeUavs[Math.min(activeUavs.length - 1, Math.floor(index / sectorSize))];
+    const mutableStrip = plan.strips.find((candidate) => candidate.id === strip.id);
+    if (!owner || !mutableStrip) return;
+    mutableStrip.status = "planned";
+    mutableStrip.assignedUavId = owner.id;
+    buckets.get(owner.id)?.push(mutableStrip);
+  });
+
+  return buckets;
+}
+
+function rebuildStripsForContingencyRecovery(
+  plan: MissionPlan,
+  sourcePlan: MissionPlan,
+  timeS: number,
+  pattern: InfillPattern,
+): CoverageStrip[] {
+  const coveredCenters: Point[] = [];
+  sourcePlan.strips.forEach((strip) => {
+    const owner = sourcePlan.uavs.find((uav) => uav.id === strip.assignedUavId);
+    if (!owner) return;
+    if (stripCompletionTime(owner.originalRoute ?? owner.route, strip.id) <= timeS) {
+      coveredCenters.push(strip.center);
+    }
+  });
+
+  const recoveryStrips = generateRecoveryStrips(
+    plan.aoo,
+    plan.config,
+    pattern,
+    coveredCenters,
+  ).map((strip) => {
+    const blocked = plan.nfzs.some((nfz) =>
+      stripIntersectsNfz(strip, nfz, plan.config.sensorSwathM),
+    );
+    return blocked ? { ...strip, status: "blocked_by_nfz" as const } : strip;
+  });
+
+  const preserved = plan.strips.filter((strip) =>
+    coveredCenters.some((center) => distance(center, strip.center) < plan.config.sensorSwathM * 0.55),
+  );
+
+  return [...preserved, ...recoveryStrips];
+}
+
 function redistributeRemainingStripsForPattern(
   plan: MissionPlan,
   sourcePlan: MissionPlan,
@@ -483,6 +626,7 @@ function redistributeRemainingStripsForPattern(
 
 function infillPatternSummary(pattern: InfillPattern) {
   if (pattern === "zigzag") return "zigzag infill";
+  if (pattern === "spiral") return "outside-in spiral infill";
   if (pattern === "grid") return "grid infill";
   if (pattern === "triangles") return "triangle infill";
   if (pattern === "tri_hex") return "tri-hex infill";
@@ -644,8 +788,11 @@ export function applyVehicleLoss(
   );
 
   const activeUavs = plan.uavs.filter((uav) => uav.status !== "lost" && !uav.reserve);
+  const initialPattern = initialInfillPattern(plan.config);
   const contingencyPattern = contingencyInfillPattern(plan.config);
+  const patternsMatch = initialPattern === contingencyPattern;
   const contingencySummary = infillPatternSummary(contingencyPattern);
+  const initialSummary = infillPatternSummary(initialPattern);
   if (!fullSignal && mode === "spread_remaining_swarm") {
     addEvent(
       plan,
@@ -743,13 +890,38 @@ export function applyVehicleLoss(
       replacementId,
     );
   } else {
-    const workByUav = redistributeRemainingStripsForPattern(
-      plan,
-      sourcePlan,
-      activeUavs,
-      lossDetectedAtS,
-      contingencyPattern,
-    );
+    let workByUav: Map<string, CoverageStrip[]>;
+    let routePattern = contingencyPattern;
+
+    if (patternsMatch) {
+      workByUav = redistributeLostDebtOnly(
+        plan,
+        sourcePlan,
+        activeUavs,
+        failed.id,
+        lossDetectedAtS,
+      );
+      routePattern = initialPattern;
+    } else {
+      plan.strips = rebuildStripsForContingencyRecovery(
+        plan,
+        sourcePlan,
+        lossDetectedAtS,
+        contingencyPattern,
+      );
+      const recoveryRemaining = plan.strips.filter(
+        (strip) =>
+          strip.status !== "blocked_by_nfz" &&
+          strip.status !== "completed" &&
+          strip.status !== "coverage_debt",
+      );
+      workByUav = assignRemainingStripsToActiveUavs(
+        plan,
+        activeUavs,
+        contingencyPattern,
+        recoveryRemaining,
+      );
+    }
 
     activeUavs.forEach((uav, index) => {
       const future = workByUav.get(uav.id) ?? pendingAssignedStrips(plan, uav, lossDetectedAtS);
@@ -763,14 +935,23 @@ export function applyVehicleLoss(
             strip.status !== "completed",
         )
         .map((strip) => strip.id);
-      buildContinuationForUav(plan, uav, future, lossDetectedAtS + index * 8, index);
+      buildContinuationForUav(
+        plan,
+        uav,
+        future,
+        lossDetectedAtS + index * 8,
+        index,
+        routePattern,
+      );
     });
     addMessage(
       plan,
       lossDetectedAtS + 10,
       "SWARM_REDISTRIBUTE",
       "BASE",
-      `Full-signal loss: ${contingencySummary} redistributed unfinished strips`,
+      patternsMatch
+        ? `Full-signal loss: ${initialSummary} continues unfinished paths; lost-sector debt absorbed`
+        : `Full-signal loss: ${contingencySummary} replans remaining area to recover coverage and vary approach`,
       undefined,
       activeUavs.map((uav) => uav.id),
     );
@@ -778,7 +959,9 @@ export function applyVehicleLoss(
       plan,
       lossDetectedAtS + 15,
       "warning",
-      `${contingencySummary} rebalanced unfinished coverage across ${activeUavs.map((uav) => uav.label).join(", ")}`,
+      patternsMatch
+        ? `${activeUavs.map((uav) => uav.label).join(", ")} continue uncompleted ${initialSummary} paths and absorb lost-sector debt`
+        : `${contingencySummary} rebalanced across ${activeUavs.map((uav) => uav.label).join(", ")} to recover the full remaining area`,
     );
   }
 

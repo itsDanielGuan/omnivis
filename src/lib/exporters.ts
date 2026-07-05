@@ -148,6 +148,7 @@ export function buildMissionArtifacts(plan: MissionPlan): MissionArtifact[] {
     plan.config.initialInfillPattern ?? plan.config.pathPattern ?? "rectilinear";
   const contingencyInfill =
     plan.config.contingencyInfillPattern ?? initialInfill;
+  const patternsMatch = initialInfill === contingencyInfill;
   const missionContract = {
     schema: "omnivis.mission_contract.v1",
     missionId: plan.id,
@@ -203,7 +204,9 @@ export function buildMissionArtifacts(plan: MissionPlan): MissionArtifact[] {
       activeMode: plan.lossResponseMode,
       dispatchReplacement:
         "Replacement UAVs launch from the active home or backup base and inherit unfinished work from the lost aircraft.",
-      spreadRemainingSwarm: `In full-signal operation, unfinished strips are redistributed using the ${contingencyInfill} contingency infill.`,
+      spreadRemainingSwarm: patternsMatch
+        ? "In full-signal operation with matching infill patterns, active UAVs continue uncompleted paths and absorb lost-sector debt."
+        : `In full-signal operation with a different contingency infill, the swarm replans the remaining area using ${contingencyInfill} to recover coverage and vary approach.`,
     },
     popUpNfz:
       "Live NFZ updates block intersecting strips and trigger NFZ-safe replans for affected future route legs.",
