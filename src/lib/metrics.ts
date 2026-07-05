@@ -75,6 +75,21 @@ function estimateMinSeparation(plan: MissionPlan): number {
   return min;
 }
 
+function messageTransmissionCount(plan: MissionPlan): number {
+  return plan.messages.reduce((sum, message) => {
+    if (!message.countInMission) return sum;
+    const recipients = message.targetIds?.length
+      ? message.targetIds
+      : message.targetId
+        ? [message.targetId]
+        : [];
+    const distinctRecipients = new Set(
+      recipients.filter((recipientId) => recipientId !== message.sourceId),
+    );
+    return sum + Math.max(1, distinctRecipients.size);
+  }, 0);
+}
+
 export function computeMissionMetrics(plan: MissionPlan): MissionMetrics {
   const activeUavs = plan.uavs.filter((uav) => uav.status !== "lost" && !uav.combat);
   const missionCompletionTimeS = Math.max(
@@ -105,7 +120,7 @@ export function computeMissionMetrics(plan: MissionPlan): MissionMetrics {
     averageUtilizationPct:
       activeUavs.reduce((sum, uav) => sum + uav.utilizationPct, 0) /
       Math.max(1, activeUavs.length),
-    messagesUsed: plan.messages.filter((message) => message.countInMission).length,
+    messagesUsed: messageTransmissionCount(plan),
     totalStrips: plan.strips.length,
     completedStrips,
     coverageDebtStripCount,

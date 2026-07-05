@@ -74,7 +74,8 @@ export type ThreatPhase =
   | "loiter_hold"
   | "striking"
   | "friendly"
-  | "destroyed";
+  | "destroyed"
+  | "removed";
 
 export type UavStatus =
   | "ready"
@@ -215,12 +216,15 @@ export type UavPlan = {
   threatRole?: "confirm" | "strike";
   threatId?: string;
   combat?: boolean;
+  batteryReliefAtS?: number;
+  batteryReliefReplacementId?: string;
 };
 
 export type Threat = {
   id: string;
   kind: ThreatKind;
   point: Point;
+  lastKnownPoint?: Point;
   createdAtS: number;
   detectedByUavId?: string;
   detectedAtS?: number;
@@ -255,7 +259,13 @@ export type MissionMessageType =
   | "SWARM_REDISTRIBUTE"
   | "NFZ_EXCEPTION_TOKEN"
   | "RTB_SLOT_SYNC"
-  | "SIGNAL_REGAINED";
+  | "SIGNAL_REGAINED"
+  | "THREAT_DETECTION_REPORT"
+  | "THREAT_CONFIRM_REQUEST"
+  | "THREAT_CONFIRM_RESULT"
+  | "THREAT_DECISION"
+  | "THREAT_TRACK_UPDATE"
+  | "STRIKE_TASKING";
 
 export type MissionMessage = {
   id: string;
@@ -274,6 +284,7 @@ export type MissionEvent = {
   severity: Severity;
   text: string;
   uavId?: string;
+  threatId?: string;
 };
 
 export type MissionMetrics = {

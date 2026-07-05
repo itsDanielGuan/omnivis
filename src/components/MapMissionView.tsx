@@ -1195,7 +1195,18 @@ export function MapMissionView({
         areas,
         homeBases,
         planningNfzs,
-        planningThreats: plan ? [] : planningThreats,
+        planningThreats: plan
+          ? plan.threats
+              .filter(
+                (threat) =>
+                  !["destroyed", "friendly", "removed"].includes(threat.phase),
+              )
+              .map((threat) => ({
+                id: threat.id,
+                kind: threat.kind,
+                point: threat.point,
+              }))
+          : planningThreats,
         draftPolygon,
         editorMode,
         selectedAreaId,

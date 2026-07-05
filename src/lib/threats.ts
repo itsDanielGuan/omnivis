@@ -10,6 +10,7 @@ import {
 import type {
   CoverageStrip,
   MissionEvent,
+  MissionMessage,
   MissionPlan,
   Nfz,
   Point,
@@ -28,6 +29,7 @@ const LOITER_HOLD_S = 120; // fixed loiter-hold before a medium/large is cleared
 const STRIKE_LAUNCH_DELAY_S = 15; // ground time before the strike package launches
 const CONTINUOUS_SPACING_S = 26; // gap between sequential impacts (continuous strike)
 const SATURATION_CONVERGE_S = 28; // simultaneous-strike run-in once the ring is set
+const DYNAMIC_TARGET_LURK_S = 35; // brief local orbit after a live target moves/disappears
 
 const STRIKE_COLOR = "#f43f5e";
 const STRIKE_SOFT = "rgba(244, 63, 94, 0.22)";
@@ -74,6 +76,7 @@ function addEvent(
   severity: MissionEvent["severity"],
   text: string,
   uavId?: string,
+  threatId?: string,
 ) {
   plan.events.push({
     id: `EVT_${String(plan.events.length + 1).padStart(3, "0")}_THR`,
@@ -81,6 +84,32 @@ function addEvent(
     severity,
     text,
     uavId,
+    threatId,
+  });
+}
+
+function messageId(plan: MissionPlan, suffix: string) {
+  return `MSG_${String(plan.messages.length + 1).padStart(3, "0")}_${suffix}`;
+}
+
+function addMessage(
+  plan: MissionPlan,
+  timeS: number,
+  type: MissionMessage["type"],
+  sourceId: string,
+  text: string,
+  targetId?: string,
+  targetIds?: string[],
+) {
+  plan.messages.push({
+    id: messageId(plan, type),
+    timeS,
+    type,
+    sourceId,
+    targetId,
+    targetIds,
+    countInMission: type !== "MISSION_LOAD",
+    text,
   });
 }
 
@@ -374,7 +403,14 @@ export function stageThreat(
     phase: "undetected",
   };
   plan.threats.push(threat);
-  addEvent(plan, timeS, "info", `${threatLabel(kind)} added to the mission map; awaiting onboard detection`);
+  addEvent(
+    plan,
+    timeS,
+    "info",
+    `${threatLabel(kind)} added to the mission map; awaiting onboard detection`,
+    undefined,
+    threat.id,
+  );
   plan.metrics = computeMissionMetrics(plan);
   return plan;
 }
@@ -490,6 +526,15 @@ function activateThreatInWindow(
     "warning",
     `${discoverer.label} detected a ${threatLabel(threat.kind)} and is loitering the contact`,
     discoverer.id,
+    threat.id,
+  );
+  addMessage(
+    plan,
+    detectedAtS + 1,
+    "THREAT_DETECTION_REPORT",
+    discoverer.id,
+    `${discoverer.label} reported ${threatLabel(threat.kind)} contact to home base`,
+    "BASE",
   );
   if (second) {
     addEvent(
@@ -497,6 +542,15 @@ function activateThreatInWindow(
       secondStartS,
       "info",
       `${second.label} dispatched to confirm the contact; remaining swarm keeps searching`,
+      second.id,
+      threat.id,
+    );
+    addMessage(
+      plan,
+      secondStartS,
+      "THREAT_CONFIRM_REQUEST",
+      discoverer.id,
+      `${discoverer.label} handed contact coordinates to ${second.label} for confirmation`,
       second.id,
     );
   }
@@ -509,6 +563,16 @@ function activateThreatInWindow(
       resolveS,
       "success",
       `Contact confirmed friendly (merchant); ${discoverer.label} resumes search, ${second?.label ?? "escort"} returns to base`,
+      undefined,
+      threat.id,
+    );
+    addMessage(
+      plan,
+      resolveS,
+      "THREAT_CONFIRM_RESULT",
+      second?.id ?? discoverer.id,
+      `Contact confirmed friendly and reported to home base`,
+      "BASE",
     );
   } else {
     threat.phase = "awaiting_decision";
@@ -517,6 +581,16 @@ function activateThreatInWindow(
       confirmArrivalS,
       "danger",
       `${threatLabel(threat.kind)} confirmed hostile; operator decision required (loiter or strike)`,
+      undefined,
+      threat.id,
+    );
+    addMessage(
+      plan,
+      confirmArrivalS,
+      "THREAT_CONFIRM_RESULT",
+      second?.id ?? discoverer.id,
+      `${threatLabel(threat.kind)} confirmed hostile and reported to home base`,
+      "BASE",
     );
   }
 
@@ -552,6 +626,153 @@ function currentRadius(prefix: RouteWaypoint[], center: Point, fallback: number)
   if (!last) return fallback;
   const d = distance(last, center);
   return d > 40 ? d : fallback;
+}
+
+function clearThreatState(threat: Threat, point: Point, timeS: number) {
+  threat.point = point;
+  threat.lastKnownPoint = undefined;
+  threat.createdAtS = timeS;
+  threat.detectedByUavId = undefined;
+  threat.detectedAtS = undefined;
+  threat.confirmUavId = undefined;
+  threat.confirmArrivalS = undefined;
+  threat.resolvedAtS = undefined;
+  threat.strike = undefined;
+}
+
+function clearFutureThreatEvents(plan: MissionPlan, threatId: string, timeS: number) {
+  plan.events = plan.events.filter((event) => {
+    return event.timeS <= timeS || event.threatId !== threatId;
+  });
+}
+
+function releaseThreatResponders(
+  plan: MissionPlan,
+  threat: Threat,
+  timeS: number,
+  label: string,
+) {
+  const responderIds = new Set(
+    [threat.detectedByUavId, threat.confirmUavId].filter(Boolean) as string[],
+  );
+  plan.uavs = plan.uavs.filter(
+    (uav) => !(uav.combat && uav.threatRole === "strike" && uav.threatId === threat.id),
+  );
+
+  responderIds.forEach((uavId) => {
+    const uav = plan.uavs.find((candidate) => candidate.id === uavId);
+    if (!uav || uav.status === "lost") return;
+    const uavIndex = plan.uavs.findIndex((candidate) => candidate.id === uav.id);
+    const startS = Math.max(timeS, uav.route[0]?.t ?? 0);
+    const untilS = startS + DYNAMIC_TARGET_LURK_S;
+    const prefix = splicePrefix(uav.route, startS);
+    const anchor = (prefix.at(-1) ?? interpolateRoute(uav.route, startS)) as RouteWaypoint;
+    const radius = currentRadius(prefix, threat.point, loiterRadiusM(plan.config, threat.kind));
+    const orbit = loiterOrbit(
+      threat.point,
+      radius,
+      anchor,
+      anchor.t,
+      plan.config.speedMps,
+      DYNAMIC_TARGET_LURK_S,
+      label,
+    );
+    const holdEnd = (orbit.at(-1) ?? anchor) as RouteWaypoint;
+    const resume = resumeSearchTail(plan, uav, holdEnd, uavIndex);
+    uav.status = "replanned";
+    uav.threatId = undefined;
+    uav.threatRole = undefined;
+    uav.route = [...prefix, ...orbit, ...resume.tail];
+    uav.coverageTimeS += resume.coverageTimeS;
+    recomputeUav(plan, uav);
+    addEvent(
+      plan,
+      untilS,
+      "info",
+      `${uav.label} completed local target-lost lurk and resumed patrol`,
+      uav.id,
+      threat.id,
+    );
+    addMessage(
+      plan,
+      startS + 1,
+      "THREAT_TRACK_UPDATE",
+      uav.id,
+      `${uav.label} reported target track lost while responders lurk locally`,
+      "BASE",
+    );
+  });
+}
+
+export function moveThreatTarget(
+  sourcePlan: MissionPlan,
+  threatId: string,
+  point: Point,
+  timeS: number,
+): MissionPlan {
+  const source = sourcePlan.threats.find((threat) => threat.id === threatId);
+  if (!source || source.phase === "removed" || source.phase === "destroyed") return sourcePlan;
+
+  let plan = clonePlan(sourcePlan);
+  const threat = plan.threats.find((candidate) => candidate.id === threatId) as Threat;
+  const editS = Math.max(0, timeS);
+  const wasActive = threat.phase !== "undetected";
+
+  if (wasActive) {
+    const releaseThreat = {
+      ...threat,
+      point: threat.lastKnownPoint ?? threat.point,
+    };
+    releaseThreatResponders(plan, releaseThreat, editS, "target track shifted; local reacquisition lurk");
+  }
+  clearFutureThreatEvents(plan, threat.id, editS);
+  clearThreatState(threat, point, editS);
+  threat.phase = "undetected";
+  addEvent(
+    plan,
+    editS,
+    wasActive ? "warning" : "info",
+    `${threatLabel(threat.kind)} target shifted; onboard sensors will reacquire when in range`,
+    undefined,
+    threat.id,
+  );
+  plan.metrics = computeMissionMetrics(plan);
+  plan = detectThreatsInRange(plan, editS, editS);
+  return plan;
+}
+
+export function removeThreatTarget(
+  sourcePlan: MissionPlan,
+  threatId: string,
+  timeS: number,
+): MissionPlan {
+  const source = sourcePlan.threats.find((threat) => threat.id === threatId);
+  if (!source || source.phase === "removed") return sourcePlan;
+
+  const plan = clonePlan(sourcePlan);
+  const threat = plan.threats.find((candidate) => candidate.id === threatId) as Threat;
+  const removeS = Math.max(0, timeS);
+  if (threat.phase !== "undetected" && threat.phase !== "friendly" && threat.phase !== "destroyed") {
+    releaseThreatResponders(plan, threat, removeS, "target disappeared; local confirmation lurk");
+  } else {
+    plan.uavs = plan.uavs.filter(
+      (uav) => !(uav.combat && uav.threatRole === "strike" && uav.threatId === threat.id),
+    );
+  }
+  clearFutureThreatEvents(plan, threat.id, removeS);
+  threat.phase = "removed";
+  threat.resolvedAtS = removeS;
+  threat.strike = undefined;
+  addEvent(
+    plan,
+    removeS,
+    "warning",
+    `${threatLabel(threat.kind)} target disappeared; responders lurk then return to patrol`,
+    undefined,
+    threat.id,
+  );
+  plan.metrics = computeMissionMetrics(plan);
+  return plan;
 }
 
 function truncateAndHold(
@@ -607,7 +828,7 @@ function buildStrikePackage(
   strikeType: StrikeType,
   droneCount: number,
   launchS: number,
-): number {
+): { impactS: number; strikeUavIds: string[] } {
   const base = normalizeHomeBase(plan.strikeBase ?? plan.homeBase);
   const keepOut = threatKeepOut(threat);
   const avoidNfzs = [...plan.nfzs, keepOut];
@@ -615,6 +836,7 @@ function buildStrikePackage(
   const approachRadius = keepOut.radiusM + 60;
   const count = Math.max(1, Math.round(droneCount));
   let finalImpactS = launchS;
+  const strikeUavIds: string[] = [];
 
   if (strikeType === "saturation") {
     // Fan out to a surrounding ring, hold, then strike simultaneously.
@@ -638,7 +860,9 @@ function buildStrikePackage(
       const ringAnchor = waypoint(station.ringPoint, holdUntil, "loiter", { label: "saturation hold" });
       const impact = waypoint(threat.point, impactS, "strike", { label: "simultaneous strike" });
       const route = [station.start, ...station.approach, ringAnchor, impact];
-      plan.uavs.push(makeStrikeUav(plan, threat, i, route));
+      const strikeUav = makeStrikeUav(plan, threat, i, route);
+      strikeUavIds.push(strikeUav.id);
+      plan.uavs.push(strikeUav);
     });
   } else {
     // Continuous: launch one at a time, impact sequentially.
@@ -652,11 +876,13 @@ function buildStrikePackage(
       const runIn = approach.at(-1) ?? start;
       const impact = straightLeg(runIn as RouteWaypoint, threat.point, speed, "strike", "strike run");
       finalImpactS = Math.max(finalImpactS, impact.t);
-      plan.uavs.push(makeStrikeUav(plan, threat, i, [start, ...approach, impact]));
+      const strikeUav = makeStrikeUav(plan, threat, i, [start, ...approach, impact]);
+      strikeUavIds.push(strikeUav.id);
+      plan.uavs.push(strikeUav);
     }
   }
 
-  return finalImpactS;
+  return { impactS: finalImpactS, strikeUavIds };
 }
 
 export function applyThreatDecision(
@@ -680,23 +906,44 @@ export function applyThreatDecision(
   if (decision.action === "loiter") {
     threat.phase = "loiter_hold";
     resolveS = decisionS + LOITER_HOLD_S;
+    const decisionTargets = [discoverer?.id, second?.id].filter(Boolean) as string[];
+    addMessage(
+      plan,
+      decisionS,
+      "THREAT_DECISION",
+      "BASE",
+      `Home base sent loiter-hold decision for ${threatLabel(threat.kind)}`,
+      undefined,
+      decisionTargets,
+    );
     addEvent(
       plan,
       decisionS,
       "info",
       `Operator ordered loiter-hold on the ${threatLabel(threat.kind)}; will clear as friendly after hold`,
+      undefined,
+      threat.id,
     );
     addEvent(
       plan,
       resolveS,
       "success",
       `Loiter-hold elapsed; ${threatLabel(threat.kind)} treated as friendly`,
+      undefined,
+      threat.id,
     );
     threat.phase = "friendly";
     threat.resolvedAtS = resolveS;
   } else {
     const launchS = decisionS + STRIKE_LAUNCH_DELAY_S;
-    const impactS = buildStrikePackage(plan, threat, decision.strikeType, decision.droneCount, launchS);
+    const strikePackage = buildStrikePackage(
+      plan,
+      threat,
+      decision.strikeType,
+      decision.droneCount,
+      launchS,
+    );
+    const impactS = strikePackage.impactS;
     threat.strike = {
       type: decision.strikeType,
       droneCount: Math.max(1, Math.round(decision.droneCount)),
@@ -707,13 +954,31 @@ export function applyThreatDecision(
     resolveS = impactS;
     threat.phase = "striking";
     threat.resolvedAtS = impactS;
+    addMessage(
+      plan,
+      launchS,
+      "STRIKE_TASKING",
+      "BASE",
+      `Home base tasked ${strikePackage.strikeUavIds.length} strike drones against ${threatLabel(threat.kind)}`,
+      undefined,
+      strikePackage.strikeUavIds,
+    );
     addEvent(
       plan,
       launchS,
       "danger",
       `${decision.strikeType === "saturation" ? "Saturation" : "Continuous"} strike launched (${Math.max(1, Math.round(decision.droneCount))} drones) from ${(plan.strikeBase ?? plan.homeBase).label}`,
+      undefined,
+      threat.id,
     );
-    addEvent(plan, impactS, "danger", `${threatLabel(threat.kind)} destroyed`);
+    addEvent(
+      plan,
+      impactS,
+      "danger",
+      `${threatLabel(threat.kind)} destroyed`,
+      undefined,
+      threat.id,
+    );
   }
 
   // Discoverer holds until resolution, then resumes searching.

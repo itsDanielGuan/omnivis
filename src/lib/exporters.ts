@@ -129,6 +129,7 @@ function threatTargetsForExport(plan: MissionPlan) {
       kind: threat.kind,
       phase: threat.phase,
       localM: threat.point,
+      lastKnownLocalM: threat.lastKnownPoint,
       lat: geo.lat,
       lon: geo.lon,
       createdAtS: threat.createdAtS,
@@ -181,6 +182,8 @@ export function buildMissionArtifacts(plan: MissionPlan): MissionArtifact[] {
       status: uav.status,
       assignedStripIds: uav.assignedStripIds,
       rtbSlotS: uav.rtbSlotS,
+      batteryReliefAtS: uav.batteryReliefAtS,
+      batteryReliefReplacementId: uav.batteryReliefReplacementId,
       color: uav.color,
     })),
     strips: plan.strips.map((strip) => ({

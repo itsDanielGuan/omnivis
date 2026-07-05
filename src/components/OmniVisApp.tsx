@@ -20,6 +20,7 @@ import {
 import { DEFAULT_CONFIG, getMapPreset } from "@/lib/presets";
 import { normalizeHomeBase } from "@/lib/routing";
 import {
+  applyBatteryLowReplacement,
   applyBaseOfflineFailover,
   applyNfz,
   applyNfzSetUpdate,
@@ -32,8 +33,10 @@ import {
   applyThreatDecision,
   defaultLoiterForArrivedThreats,
   detectThreatsInRange,
+  moveThreatTarget,
   nextThreatDecisionTimeS,
   pendingThreatAt,
+  removeThreatTarget,
   stageThreat,
 } from "@/lib/threats";
 import type {
@@ -292,9 +295,10 @@ export function OmniVisApp() {
     threatScanTimeRef.current = toTimeS;
     if (toTimeS <= fromTimeS + 0.01) return;
     const detectedPlan = detectThreatsInRange(plan, fromTimeS, toTimeS);
-    if (detectedPlan === plan) return;
-    setPlan(detectedPlan);
-    if (pendingThreatAt(detectedPlan, toTimeS)) {
+    const batteryPlan = applyBatteryLowReplacement(detectedPlan, toTimeS);
+    if (batteryPlan === plan) return;
+    setPlan(batteryPlan);
+    if (pendingThreatAt(batteryPlan, toTimeS)) {
       setIsRunning(false);
     }
   }, [plan, simTimeS]);
@@ -315,6 +319,15 @@ export function OmniVisApp() {
   const canTriggerSelectedLoss = canArmCommunicationLoss(selectedUav);
   const pendingThreat = pendingThreatAt(plan, simTimeS);
   const strikeBaseLabel = plan?.strikeBase?.label ?? plan?.homeBase.label ?? "Primary base";
+  const editableThreats: PlanningThreat[] = plan
+    ? plan.threats
+        .filter((threat) => !["destroyed", "friendly", "removed"].includes(threat.phase))
+        .map((threat) => ({
+          id: threat.id,
+          kind: threat.kind,
+          point: threat.point,
+        }))
+    : planningThreats;
 
   const compileMission = useCallback(() => {
     const area = selectedArea ?? areas[0];
@@ -571,9 +584,12 @@ export function OmniVisApp() {
   };
 
   const deleteThreat = (threatId: string) => {
-    setPlanningThreats((current) => current.filter((threat) => threat.id !== threatId));
+    if (plan) {
+      setPlan(removeThreatTarget(plan, threatId, simTimeS));
+    } else {
+      setPlanningThreats((current) => current.filter((threat) => threat.id !== threatId));
+    }
     if (selectedThreatId === threatId) setSelectedThreatId(undefined);
-    setPlan(null);
   };
 
   const linkBaseToArea = () => {
@@ -827,13 +843,32 @@ export function OmniVisApp() {
         ),
       );
     } else if (kind === "threat") {
-      setPlanningThreats((current) =>
-        current.map((threat) =>
-          threat.id === id
-            ? { ...threat, point: { x: threat.point.x + delta.x, y: threat.point.y + delta.y } }
-            : threat,
-        ),
-      );
+      if (plan) {
+        setPlan((current) =>
+          current
+            ? {
+                ...current,
+                threats: current.threats.map((threat) =>
+                  threat.id === id
+                    ? {
+                        ...threat,
+                        lastKnownPoint: threat.lastKnownPoint ?? threat.point,
+                        point: { x: threat.point.x + delta.x, y: threat.point.y + delta.y },
+                      }
+                    : threat,
+                ),
+              }
+            : current,
+        );
+      } else {
+        setPlanningThreats((current) =>
+          current.map((threat) =>
+            threat.id === id
+              ? { ...threat, point: { x: threat.point.x + delta.x, y: threat.point.y + delta.y } }
+              : threat,
+          ),
+        );
+      }
     } else {
       setHomeBases((current) =>
         current.map((base) => {
@@ -854,7 +889,7 @@ export function OmniVisApp() {
         }),
       );
     }
-    if (kind !== "nfz") {
+    if (kind !== "nfz" && kind !== "threat") {
       setPlan(null);
     }
   };
@@ -865,6 +900,14 @@ export function OmniVisApp() {
     delta?: Point,
     vertexIndex?: number,
   ) => {
+    if (kind === "threat") {
+      if (!plan) return;
+      setPlan((current) => {
+        const threat = current?.threats.find((candidate) => candidate.id === id);
+        return current && threat ? moveThreatTarget(current, id, threat.point, simTimeS) : current;
+      });
+      return;
+    }
     if (kind !== "nfz") return;
     if (delta && Math.hypot(delta.x, delta.y) > 0.1) {
       handleMoveEditorFeature(kind, id, delta, vertexIndex);
@@ -972,7 +1015,7 @@ export function OmniVisApp() {
           areas={areas}
           homeBases={homeBases}
           planningNfzs={planningNfzs}
-          planningThreats={planningThreats}
+          planningThreats={editableThreats}
           selectedAreaId={selectedAreaId}
           selectedBaseId={selectedBaseId}
           selectedNfzId={selectedNfzId}

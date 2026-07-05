@@ -94,18 +94,6 @@ function addMessage(
   targetIds?: string[],
 ) {
   const countInMission = type !== "MISSION_LOAD";
-  const silentAllowsMessage = type === "HEALTH_EPOCH" || type === "HEALTH_MISS";
-  if (plan.config.commsPolicy === "silent_operation" && countInMission && !silentAllowsMessage) {
-    addEvent(
-      plan,
-      timeS,
-      "info",
-      `${text}; silent operation kept GPS and command traffic off-net`,
-      sourceId,
-    );
-    return;
-  }
-
   plan.messages.push({
     id: messageId(plan, type),
     timeS,
@@ -794,6 +782,175 @@ export function applyVehicleLoss(
     );
   }
 
+  plan.metrics = computeMissionMetrics(plan);
+  return plan;
+}
+
+function isRechargingAt(uav: UavPlan, timeS: number): boolean {
+  return uav.route.some((point, index) => {
+    const previous = uav.route[index - 1];
+    return point.phase === "recharge" && previous && timeS >= previous.t && timeS < point.t;
+  });
+}
+
+function batteryPctAt(plan: MissionPlan, uav: UavPlan, timeS: number): number {
+  const boundedTimeS = Math.max(uav.route[0]?.t ?? 0, timeS);
+  const enduranceS = Math.max(60, plan.config.enduranceMin * 60);
+  const sortieStart =
+    uav.route
+      .filter(
+        (point) =>
+          point.t <= boundedTimeS && (point.phase === "preflight" || point.phase === "recharge"),
+      )
+      .at(-1)?.t ?? uav.route[0]?.t ?? 0;
+  return Math.max(0, Math.min(100, 100 - ((boundedTimeS - sortieStart) / enduranceS) * 100));
+}
+
+export function applyBatteryLowReplacement(
+  sourcePlan: MissionPlan,
+  timeS: number,
+): MissionPlan {
+  const reservePct = Math.max(
+    0,
+    Math.min(100, (sourcePlan.config.batteryReserveMin / sourcePlan.config.enduranceMin) * 100),
+  );
+  const candidate = sourcePlan.uavs.find((uav) => {
+    if (uav.reserve || uav.combat || uav.status === "lost" || uav.batteryReliefAtS !== undefined) {
+      return false;
+    }
+    if (isRechargingAt(uav, timeS)) return false;
+    if (batteryPctAt(sourcePlan, uav, timeS) > reservePct + 5) return false;
+    return pendingAssignedStrips(sourcePlan, uav, timeS).length > 0;
+  });
+  if (!candidate) return sourcePlan;
+
+  const plan = clonePlan(sourcePlan);
+  const uav = plan.uavs.find((item) => item.id === candidate.id);
+  if (!uav) return sourcePlan;
+  const uavIndex = Math.max(0, plan.uavs.findIndex((item) => item.id === uav.id));
+  const reliefS = Math.max(timeS, uav.route[0]?.t ?? 0);
+  const futureStrips = pendingAssignedStrips(plan, uav, reliefS);
+  if (futureStrips.length === 0) return sourcePlan;
+
+  const replacementId = `UAV_B${plan.uavs.filter((item) => item.id.startsWith("UAV_B")).length + 1}`;
+  futureStrips.forEach((future) => {
+    const strip = plan.strips.find((candidateStrip) => candidateStrip.id === future.id);
+    if (strip) {
+      strip.status = "planned";
+      strip.assignedUavId = replacementId;
+    }
+  });
+
+  const current = interpolateRoute(uav.route, reliefS);
+  const prefix = [
+    ...routeAtOrBefore(uav.route, reliefS).filter((point) => point.t < reliefS - 0.1),
+    {
+      ...current,
+      t: reliefS,
+      phase: "return" as const,
+      label: "battery reserve reached; handing coverage to replacement",
+    },
+  ];
+  const returnRoute = buildReturnRouteViaBaseWaypoint({
+    start: current,
+    startTimeS: reliefS,
+    base: plan.homeBase,
+    config: plan.config,
+    nfzs: plan.nfzs,
+    uavIndex,
+  });
+  const rtb = returnRoute.slice(1).map((point) => ({ ...point, phase: "return" as const }));
+  const rtbEnd = rtb.at(-1) ?? prefix.at(-1);
+  const rechargeEndS = (rtbEnd?.t ?? reliefS) + Math.max(60, plan.config.rechargeDurationMin * 60);
+  uav.originalRoute = uav.originalRoute ?? uav.route;
+  uav.route = [
+    ...prefix,
+    ...rtb,
+    {
+      ...plan.homeBase.point,
+      t: rechargeEndS,
+      phase: "recharge",
+      label: `battery relief recharge ${plan.config.rechargeDurationMin} min`,
+    },
+  ];
+  uav.status = "replanned";
+  uav.batteryReliefAtS = reliefS;
+  uav.batteryReliefReplacementId = replacementId;
+  uav.forcedRtbCount = (uav.forcedRtbCount ?? 0) + 1;
+  uav.rechargeCount = (uav.rechargeCount ?? 0) + 1;
+  uav.assignedStripIds = plan.strips
+    .filter((strip) => strip.assignedUavId === uav.id && strip.status === "planned")
+    .map((strip) => strip.id);
+  recomputeUavUtilization(uav);
+
+  const replacementBase = normalizeHomeBase(plan.homeBase);
+  const replacementStrips = plan.strips.filter((strip) => strip.assignedUavId === replacementId);
+  const replacementIndex = plan.uavs.length;
+  const build = buildRouteFromStart(
+    replacementBase.point,
+    reliefS + 30,
+    replacementStrips,
+    plan.config,
+    replacementBase,
+    replacementIndex,
+    true,
+    plan.nfzs,
+    contingencyInfillPattern(plan.config),
+  );
+  const replacementColor = UAV_COLORS[replacementIndex % UAV_COLORS.length] ?? UAV_COLORS[0];
+  const replacement: UavPlan = {
+    id: replacementId,
+    label: replacementId.replace("_", "-"),
+    color: replacementColor.color,
+    colorSoft: replacementColor.soft,
+    altitudeM:
+      plan.config.altitudeLayerStartM +
+      (replacementIndex + 1) * plan.config.altitudeLayerSpacingM,
+    status: "replanned",
+    reserve: true,
+    assignedStripIds: replacementStrips.map((strip) => strip.id),
+    route: build.route.map((point) => ({
+      ...point,
+      phase: point.phase === "transit" ? ("replacement" as const) : point.phase,
+      label: point.phase === "preflight" ? `battery relief launch from ${replacementBase.label}` : point.label,
+    })),
+    rtbSlotS: build.route.at(-1)?.t ?? reliefS,
+    utilizationPct: 0,
+    coverageTimeS: build.coverageTimeS,
+    rechargeCount: build.rechargeCount,
+    forcedRtbCount: build.forcedRtbCount,
+    enduranceWarning: build.enduranceWarning,
+  };
+  build.skippedStripIds.forEach((stripId) => {
+    const strip = plan.strips.find((candidateStrip) => candidateStrip.id === stripId);
+    if (strip) strip.status = "coverage_debt";
+  });
+  replacement.assignedStripIds = plan.strips
+    .filter(
+      (strip) =>
+        strip.assignedUavId === replacementId &&
+        strip.status !== "coverage_debt" &&
+        strip.status !== "blocked_by_nfz" &&
+        strip.status !== "completed",
+    )
+    .map((strip) => strip.id);
+  recomputeUavUtilization(replacement);
+  plan.uavs.push(replacement);
+  addMessage(
+    plan,
+    reliefS + 4,
+    "REPLACEMENT_DISPATCH",
+    "BASE",
+    `${uav.label} reached battery reserve; ${replacement.label} dispatched to absorb future strips`,
+    replacementId,
+  );
+  addEvent(
+    plan,
+    reliefS,
+    "warning",
+    `${uav.label} hit battery reserve; ${replacement.label} launches with ${replacement.assignedStripIds.length} reassigned strips`,
+    uav.id,
+  );
   plan.metrics = computeMissionMetrics(plan);
   return plan;
 }

@@ -203,6 +203,7 @@ export function missionToGeoJson(
   });
 
   plan.threats.forEach((threat) => {
+    if (threat.phase === "removed") return;
     const destroyed =
       threat.phase === "destroyed" ||
       (threat.phase === "striking" && (threat.strike?.impactS ?? Infinity) <= simTimeS);
